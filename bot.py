@@ -621,7 +621,6 @@ def build_leaderboard_embed(guild_name: str, metric: str, rows: list[dict]) -> d
 
 # ===== BOT SETUP =====
 intents = discord.Intents.default()
-intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 active_sprint_tasks: dict[int, asyncio.Task] = {}
