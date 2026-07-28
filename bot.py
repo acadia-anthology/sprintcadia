@@ -23,6 +23,16 @@ FANFIC_WORDS_PER_PAGE = 250
 
 SPRINT_ROLE_SETTING_KEY = "Sprint Ping Role ID"
 
+LOG_TYPE_ICONS = {"pages": "📖", "percentage": "📊", "audio": "🎧", "fanfic": "✍️"}
+LOG_TYPE_LABELS = {"pages": "Pages", "percentage": "Ebook %", "audio": "Audiobook", "fanfic": "Fanfic"}
+
+JOIN_LOG_TYPE_CHOICES = [
+    app_commands.Choice(name="Pages", value="pages"),
+    app_commands.Choice(name="Ebook %", value="percentage"),
+    app_commands.Choice(name="Audiobook", value="audio"),
+    app_commands.Choice(name="Fanfic", value="fanfic"),
+]
+
 WEEKDAY_CHOICES = [
     app_commands.Choice(name="Monday", value=0),
     app_commands.Choice(name="Tuesday", value=1),
@@ -136,6 +146,7 @@ def init_postgres_schema():
                     user_id            TEXT NOT NULL,
                     joined_at          TIMESTAMPTZ DEFAULT now(),
                     log_type           TEXT DEFAULT '',
+                    book_title         TEXT DEFAULT '',
                     raw_amount         NUMERIC,
                     pages_equivalent   NUMERIC,
                     minutes_equivalent NUMERIC,
@@ -290,10 +301,6 @@ def db_create_sprint(guild_id: int, channel_id: int, host_id: int, duration_minu
                 VALUES (%s, %s, %s, %s, %s) RETURNING id
             """, (str(guild_id), str(channel_id), str(host_id), duration_minutes, ends_at))
             sprint_id = cur.fetchone()[0]
-            cur.execute("""
-                INSERT INTO sprint_participants (sprint_id, user_id) VALUES (%s, %s)
-                ON CONFLICT DO NOTHING
-            """, (sprint_id, str(host_id)))
         conn.commit()
         return sprint_id
     except Exception as error:
@@ -354,16 +361,17 @@ def db_get_sprint(sprint_id: int) -> dict | None:
         release_pg_connection(conn)
 
 
-def db_join_sprint(sprint_id: int, user_id: int) -> bool:
+def db_join_sprint(sprint_id: int, user_id: int, log_type: str, book_title: str = "") -> bool:
     conn = get_pg_connection()
     if conn is None:
         return False
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO sprint_participants (sprint_id, user_id) VALUES (%s, %s)
+                INSERT INTO sprint_participants (sprint_id, user_id, log_type, book_title)
+                VALUES (%s, %s, %s, %s)
                 ON CONFLICT DO NOTHING
-            """, (sprint_id, str(user_id)))
+            """, (sprint_id, str(user_id), log_type, book_title))
             joined = cur.rowcount > 0
         conn.commit()
         return joined
@@ -382,7 +390,7 @@ def db_get_participants(sprint_id: int) -> list[dict]:
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT user_id, log_type, raw_amount, pages_equivalent, minutes_equivalent, reported
+                SELECT user_id, log_type, book_title, raw_amount, pages_equivalent, minutes_equivalent, reported
                 FROM sprint_participants
                 WHERE sprint_id = %s
                 ORDER BY reported DESC, COALESCE(pages_equivalent, 0) DESC, joined_at ASC
@@ -395,23 +403,26 @@ def db_get_participants(sprint_id: int) -> list[dict]:
         release_pg_connection(conn)
 
 
-def db_find_reportable_sprint(channel_id: int, user_id: int) -> dict | None:
-    """Most recent sprint in this channel the user joined and hasn't reported to yet."""
+def db_find_loggable_sprint(channel_id: int, user_id: int) -> dict | None:
+    """The sprint in this channel the user should log progress against: the active one
+    if they're in it, otherwise the most recent one they joined. Includes their own
+    log_type/book_title from that sprint so the log button knows which modal to open."""
     conn = get_pg_connection()
     if conn is None:
         return None
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT s.* FROM sprints s
+                SELECT s.*, p.log_type AS participant_log_type, p.book_title AS participant_book_title
+                FROM sprints s
                 JOIN sprint_participants p ON p.sprint_id = s.id
-                WHERE s.channel_id = %s AND p.user_id = %s AND p.reported = FALSE
-                ORDER BY s.started_at DESC LIMIT 1
+                WHERE s.channel_id = %s AND p.user_id = %s
+                ORDER BY (s.status = 'active') DESC, s.started_at DESC LIMIT 1
             """, (str(channel_id), str(user_id)))
             row = cur.fetchone()
             return dict(row) if row else None
     except Exception as error:
-        print("db_find_reportable_sprint error:", error)
+        print("db_find_loggable_sprint error:", error)
         return None
     finally:
         release_pg_connection(conn)
@@ -419,24 +430,41 @@ def db_find_reportable_sprint(channel_id: int, user_id: int) -> dict | None:
 
 def db_log_progress(sprint_id: int, user_id: int, guild_id: int, log_type: str,
                      raw_amount: float, pages_equivalent: float | None, minutes_equivalent: float | None):
+    """Logging is repeatable (like an 'update progress' action) — each call overwrites the
+    participant's prior report and only nudges user_stats by the *difference*, so re-logging
+    doesn't double-count pages/minutes already counted from an earlier report this sprint."""
     conn = get_pg_connection()
     if conn is None:
         return
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT pages_equivalent, minutes_equivalent, reported FROM sprint_participants
+                WHERE sprint_id = %s AND user_id = %s FOR UPDATE
+            """, (sprint_id, str(user_id)))
+            row = cur.fetchone()
+            old_pages = float(row["pages_equivalent"]) if row and row["pages_equivalent"] is not None else 0.0
+            old_minutes = float(row["minutes_equivalent"]) if row and row["minutes_equivalent"] is not None else 0.0
+            was_reported = bool(row["reported"]) if row else False
+
             cur.execute("""
                 UPDATE sprint_participants
                 SET log_type = %s, raw_amount = %s, pages_equivalent = %s, minutes_equivalent = %s, reported = TRUE
                 WHERE sprint_id = %s AND user_id = %s
             """, (log_type, raw_amount, pages_equivalent, minutes_equivalent, sprint_id, str(user_id)))
+
+            pages_delta = (pages_equivalent or 0) - old_pages
+            minutes_delta = (minutes_equivalent or 0) - old_minutes
+            sprint_delta = 0 if was_reported else 1
+
             cur.execute("""
                 INSERT INTO user_stats (guild_id, user_id, total_sprints, total_pages, total_minutes_read)
-                VALUES (%s, %s, 1, %s, %s)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (guild_id, user_id) DO UPDATE SET
-                    total_sprints = user_stats.total_sprints + 1,
+                    total_sprints = user_stats.total_sprints + EXCLUDED.total_sprints,
                     total_pages = user_stats.total_pages + EXCLUDED.total_pages,
                     total_minutes_read = user_stats.total_minutes_read + EXCLUDED.total_minutes_read
-            """, (str(guild_id), str(user_id), pages_equivalent or 0, minutes_equivalent or 0))
+            """, (str(guild_id), str(user_id), sprint_delta, pages_delta, minutes_delta))
         conn.commit()
     except Exception as error:
         print("db_log_progress error:", error)
@@ -610,25 +638,26 @@ def db_mark_scheduled_triggered(schedule_id: int, today_str: str):
 
 
 # ===== EMBED BUILDERS =====
+def _participant_line(p: dict) -> str:
+    icon = LOG_TYPE_ICONS.get(p.get("log_type"), "📚")
+    title = f" — reading *{p['book_title']}*" if p.get("book_title") else ""
+    return f"{icon} <@{p['user_id']}>{title}"
+
+
 def build_sprint_announcement_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
-    names = "\n".join(f"<@{p['user_id']}>" for p in participants) or "No one yet — be the first!"
-    embed = discord.Embed(
-        title="📖 Sprint started!",
-        description=(
-            f"Hosted by <@{sprint['host_id']}> — **{sprint['duration_minutes']} minutes** on the clock.\n"
-            f"Use `/sprint join` or the button below to jump in any time before it ends.\n\n"
-            f"When it ends, log your progress with the buttons on the results message."
-        ),
-        color=SPRINT_COLOR,
-    )
+    names = "\n".join(_participant_line(p) for p in participants) or "No one yet — be the first!"
+    embed = discord.Embed(title="📖 Reading sprint!", color=SPRINT_COLOR)
+    embed.add_field(name="Duration", value=f"{sprint['duration_minutes']} min", inline=True)
+    embed.add_field(name="Starts", value=f"<t:{int(sprint['started_at'].timestamp())}:R>", inline=True)
     embed.add_field(name="Ends", value=f"<t:{int(sprint['ends_at'].timestamp())}:R>", inline=True)
     embed.add_field(name=f"Participants ({len(participants)})", value=names, inline=False)
+    embed.add_field(name="Host", value=f"<@{sprint['host_id']}>", inline=False)
     embed.set_footer(text="Sprintcadia")
     return embed
 
 
 def build_sprint_status_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
-    lines = [f"<@{p['user_id']}>" for p in participants] or ["No one has joined yet."]
+    lines = [_participant_line(p) for p in participants] or ["No one has joined yet."]
     embed = discord.Embed(
         title="⏱️ Sprint status",
         description=f"Ends <t:{int(sprint['ends_at'].timestamp())}:R>",
@@ -640,10 +669,10 @@ def build_sprint_status_embed(sprint: dict, participants: list[dict]) -> discord
 
 
 def build_sprint_end_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
-    names = "\n".join(f"<@{p['user_id']}>" for p in participants) or "No one joined this one."
+    names = "\n".join(_participant_line(p) for p in participants) or "No one joined this one."
     embed = discord.Embed(
-        title="⏰ Time's up!",
-        description=f"The {sprint['duration_minutes']}-minute sprint has ended. Tap a button below to log your progress.",
+        title="⏰ Sprint ended — log your progress!",
+        description=f"The {sprint['duration_minutes']}-minute sprint is over. Tap **Log Sprint** below.",
         color=RESULT_COLOR,
     )
     embed.add_field(name="Participants", value=names, inline=False)
@@ -651,22 +680,23 @@ def build_sprint_end_embed(sprint: dict, participants: list[dict]) -> discord.Em
     return embed
 
 
-def _format_participant_line(p: dict) -> str:
+def _format_result_line(p: dict) -> str:
     uid = p["user_id"]
+    title = f" *({p['book_title']})*" if p.get("book_title") else ""
     if not p["reported"]:
-        return f"<@{uid}> — no report yet"
+        return f"<@{uid}>{title} — no report yet"
 
     log_type = p["log_type"]
     raw = p["raw_amount"]
     if log_type == "pages":
-        return f"<@{uid}> — **{float(raw):g} pages**"
+        return f"<@{uid}>{title} — **{float(raw):g} pages**"
     if log_type == "percentage":
-        return f"<@{uid}> — **{float(raw):g}%** → **{float(p['pages_equivalent']):g} pages**"
+        return f"<@{uid}>{title} — **{float(raw):g}%** → **{float(p['pages_equivalent']):g} pages**"
     if log_type == "audio":
-        return f"<@{uid}> — **{float(raw):g}%** listened → **{float(p['minutes_equivalent']):g} min**"
+        return f"<@{uid}>{title} — **{float(raw):g}%** listened → **{float(p['minutes_equivalent']):g} min**"
     if log_type == "fanfic":
-        return f"<@{uid}> — **{float(raw):g} words** → **{float(p['pages_equivalent']):g} pages**"
-    return f"<@{uid}> — reported"
+        return f"<@{uid}>{title} — **{float(raw):g} words** → **{float(p['pages_equivalent']):g} pages**"
+    return f"<@{uid}>{title} — reported"
 
 
 def build_sprint_results_embed(participants: list[dict]) -> discord.Embed:
@@ -679,7 +709,7 @@ def build_sprint_results_embed(participants: list[dict]) -> discord.Embed:
     embed = discord.Embed(title="🏁 Sprint results", color=RESULT_COLOR)
     embed.add_field(
         name="Reported",
-        value="\n".join(_format_participant_line(p) for p in reported) or "No one has reported yet.",
+        value="\n".join(_format_result_line(p) for p in reported) or "No one has reported yet.",
         inline=False,
     )
     if unreported:
@@ -734,11 +764,10 @@ active_sprint_tasks: dict[int, asyncio.Task] = {}
 
 async def apply_log(interaction: discord.Interaction, log_type: str, raw_amount: float,
                      pages_equivalent: float | None, minutes_equivalent: float | None, confirm_text: str):
-    sprint = await run_blocking(db_find_reportable_sprint, interaction.channel_id, interaction.user.id)
+    sprint = await run_blocking(db_find_loggable_sprint, interaction.channel_id, interaction.user.id)
     if sprint is None:
         embed = discord.Embed(
-            description="No open sprint here for you to report on — join one with `/sprint join`, "
-                        "or you may have already reported for this one.",
+            description="You haven't joined a sprint here yet — use `/sprint join` or the Join button first.",
             color=ALERT_COLOR,
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -748,7 +777,7 @@ async def apply_log(interaction: discord.Interaction, log_type: str, raw_amount:
     await interaction.response.send_message(confirm_text, ephemeral=True)
 
 
-async def handle_join(interaction: discord.Interaction):
+async def handle_join(interaction: discord.Interaction, log_type: str, book_title: str = ""):
     sprint = await run_blocking(db_get_active_sprint, interaction.channel_id)
     if sprint is None:
         await interaction.response.send_message(
@@ -756,12 +785,37 @@ async def handle_join(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
-    joined = await run_blocking(db_join_sprint, sprint["id"], interaction.user.id)
+    joined = await run_blocking(db_join_sprint, sprint["id"], interaction.user.id, log_type, book_title.strip())
     if joined:
-        await interaction.response.send_message(f"✅ {interaction.user.mention} joined the sprint!")
+        label = LOG_TYPE_LABELS.get(log_type, log_type)
+        extra = f" — reading *{book_title.strip()}*" if book_title.strip() else ""
+        await interaction.response.send_message(f"✅ {interaction.user.mention} joined, tracking **{label}**{extra}!")
         await refresh_sprint_announcement(sprint["id"])
     else:
         await interaction.response.send_message("You're already in this sprint.", ephemeral=True)
+
+
+async def open_log_modal_for_user(interaction: discord.Interaction):
+    """Looks up how this user is tracking their current/most-recent sprint here and opens
+    the matching modal directly — no picker needed since that choice was made at join time."""
+    sprint = await run_blocking(db_find_loggable_sprint, interaction.channel_id, interaction.user.id)
+    if sprint is None:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description="You haven't joined a sprint here yet — use `/sprint join` or the Join button first.",
+                color=ALERT_COLOR,
+            ),
+            ephemeral=True,
+        )
+        return
+    modal_cls = LOG_TYPE_MODALS.get(sprint["participant_log_type"])
+    if modal_cls is None:
+        await interaction.response.send_message(
+            embed=discord.Embed(description="Couldn't tell how you're tracking this sprint — try joining again.", color=ALERT_COLOR),
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_modal(modal_cls())
 
 
 async def refresh_sprint_announcement(sprint_id: int):
@@ -782,7 +836,7 @@ async def refresh_sprint_announcement(sprint_id: int):
         pass
 
 
-# ===== LOG MODALS (triggered by buttons on the sprint-end message) =====
+# ===== LOG MODALS (one per tracking type, opened directly — no type picker at log time) =====
 class LogPagesModal(discord.ui.Modal, title="Log Pages"):
     pages_input = discord.ui.TextInput(label="Pages read this sprint", placeholder="e.g. 42", max_length=6)
 
@@ -864,37 +918,74 @@ class LogFanficModal(discord.ui.Modal, title="Log Fanfic Words"):
         )
 
 
-# ===== PERSISTENT VIEWS =====
+LOG_TYPE_MODALS = {
+    "pages": LogPagesModal,
+    "percentage": LogPercentageModal,
+    "audio": LogAudioModal,
+    "fanfic": LogFanficModal,
+}
+
+
+# ===== JOIN FLOW (pick tracking type, then optional book/fic title) =====
+class JoinDetailsModal(discord.ui.Modal, title="Join Sprint"):
+    book_title_input = discord.ui.TextInput(label="What are you reading? (optional)", required=False, max_length=100)
+
+    def __init__(self, log_type: str):
+        super().__init__()
+        self.log_type = log_type
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await handle_join(interaction, self.log_type, self.book_title_input.value)
+
+
+class JoinTypeSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Pages", value="pages", emoji="📖", description="Track by page number"),
+            discord.SelectOption(label="Ebook %", value="percentage", emoji="📊", description="Track by percent complete (e.g. Kindle)"),
+            discord.SelectOption(label="Audiobook", value="audio", emoji="🎧", description="Track by percent listened"),
+            discord.SelectOption(label="Fanfic", value="fanfic", emoji="✍️", description="Track by word count"),
+        ]
+        super().__init__(placeholder="How are you tracking this sprint?", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(JoinDetailsModal(self.values[0]))
+
+
+class JoinTypeSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.add_item(JoinTypeSelect())
+
+
+# ===== PERSISTENT VIEWS (attached to real channel messages, re-registered every boot) =====
 class SprintJoinView(discord.ui.View):
+    """Attached to the sprint announcement — Join picks a tracking type once;
+    Update Progress re-opens whichever log modal matches that choice."""
+
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="🏁 Join Sprint", style=discord.ButtonStyle.green, custom_id="sprintcadia:join_sprint")
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await handle_join(interaction)
+        await interaction.response.send_message(
+            "How are you tracking this sprint?", view=JoinTypeSelectView(), ephemeral=True,
+        )
+
+    @discord.ui.button(label="🔄 Update Progress", style=discord.ButtonStyle.grey, custom_id="sprintcadia:update_progress")
+    async def update_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await open_log_modal_for_user(interaction)
 
 
-class SprintLogView(discord.ui.View):
-    """Attached to the sprint-end message — this is the only way to log progress; there's no slash command for it."""
+class SprintLogButtonView(discord.ui.View):
+    """Attached to the sprint-end message — the only way to log final progress; no slash command for it."""
 
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="📖 Pages", style=discord.ButtonStyle.blurple, custom_id="sprintcadia:log_pages")
-    async def log_pages_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(LogPagesModal())
-
-    @discord.ui.button(label="📊 Ebook %", style=discord.ButtonStyle.blurple, custom_id="sprintcadia:log_percentage")
-    async def log_percentage_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(LogPercentageModal())
-
-    @discord.ui.button(label="🎧 Audiobook", style=discord.ButtonStyle.blurple, custom_id="sprintcadia:log_audio")
-    async def log_audio_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(LogAudioModal())
-
-    @discord.ui.button(label="✍️ Fanfic", style=discord.ButtonStyle.blurple, custom_id="sprintcadia:log_fanfic")
-    async def log_fanfic_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(LogFanficModal())
+    @discord.ui.button(label="📝 Log Sprint", style=discord.ButtonStyle.blurple, custom_id="sprintcadia:log_sprint")
+    async def log_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await open_log_modal_for_user(interaction)
 
 
 async def finish_sprint(sprint_id: int):
@@ -922,7 +1013,7 @@ async def finish_sprint(sprint_id: int):
         await channel.send(
             content=mentions or None,
             embed=build_sprint_end_embed(sprint, participants),
-            view=SprintLogView(),
+            view=SprintLogButtonView(),
             allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
         )
     except discord.HTTPException as error:
@@ -975,8 +1066,10 @@ async def sprint_start(interaction: discord.Interaction, duration_minutes: app_c
 
 
 @sprint_group.command(name="join", description="Join the active sprint in this channel.")
-async def sprint_join(interaction: discord.Interaction):
-    await handle_join(interaction)
+@app_commands.describe(log_type="How you're tracking this sprint", book_title="What you're reading (optional)")
+@app_commands.choices(log_type=JOIN_LOG_TYPE_CHOICES)
+async def sprint_join(interaction: discord.Interaction, log_type: app_commands.Choice[str], book_title: str = ""):
+    await handle_join(interaction, log_type.value, book_title)
 
 
 @sprint_group.command(name="status", description="Show the active sprint's time remaining and participants.")
@@ -995,7 +1088,7 @@ async def sprint_status(interaction: discord.Interaction):
 async def sprint_results(interaction: discord.Interaction):
     sprint = await run_blocking(db_get_active_sprint, interaction.channel_id)
     if sprint is None:
-        sprint = await run_blocking(db_find_reportable_sprint, interaction.channel_id, interaction.user.id)
+        sprint = await run_blocking(db_find_loggable_sprint, interaction.channel_id, interaction.user.id)
     if sprint is None:
         await interaction.response.send_message(
             embed=discord.Embed(description="No recent sprint found in this channel.", color=ALERT_COLOR),
@@ -1258,7 +1351,7 @@ async def on_ready():
 
     # Persistent views need to be re-registered every time the bot restarts.
     bot.add_view(SprintJoinView())
-    bot.add_view(SprintLogView())
+    bot.add_view(SprintLogButtonView())
 
     # Re-arm timers for sprints that were still running when the bot last restarted.
     active_sprints = await run_blocking(db_get_all_active_sprints)
