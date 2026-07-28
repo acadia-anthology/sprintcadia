@@ -18,10 +18,10 @@ ALERT_COLOR = discord.Color.from_str("#EB5757")    # errors, cancellations
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-GOAL_TYPE_CHOICES = [
-    app_commands.Choice(name="Pages", value="pages"),
-    app_commands.Choice(name="Minutes", value="minutes"),
-]
+# Fanfic word-count-to-page conversion, matching Abraxos's "Fanfic Words Per Damage" default.
+FANFIC_WORDS_PER_PAGE = 250
+
+SPRINT_ROLE_SETTING_KEY = "Sprint Ping Role ID"
 
 WEEKDAY_CHOICES = [
     app_commands.Choice(name="Monday", value=0),
@@ -37,6 +37,20 @@ WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturd
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _parse_int(text: str) -> int | None:
+    try:
+        return int(str(text).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_float(text: str) -> float | None:
+    try:
+        return float(str(text).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 # ===== POSTGRES CONNECTION POOL =====
@@ -93,27 +107,39 @@ def init_postgres_schema():
                     added_at   TIMESTAMPTZ DEFAULT now()
                 )
             """)
+            # Generic per-server settings (e.g. which role to ping when a sprint starts).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS guild_settings (
+                    guild_id TEXT NOT NULL,
+                    key      TEXT NOT NULL,
+                    value    TEXT DEFAULT '',
+                    PRIMARY KEY (guild_id, key)
+                )
+            """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS sprints (
-                    id               SERIAL PRIMARY KEY,
-                    guild_id         TEXT NOT NULL,
-                    channel_id       TEXT NOT NULL,
-                    host_id          TEXT NOT NULL,
-                    goal_type        TEXT NOT NULL DEFAULT 'pages',
-                    duration_minutes INT NOT NULL,
-                    status           TEXT NOT NULL DEFAULT 'active',
-                    started_at       TIMESTAMPTZ DEFAULT now(),
-                    ends_at          TIMESTAMPTZ NOT NULL
+                    id                       SERIAL PRIMARY KEY,
+                    guild_id                 TEXT NOT NULL,
+                    channel_id               TEXT NOT NULL,
+                    host_id                  TEXT NOT NULL,
+                    duration_minutes         INT NOT NULL,
+                    status                   TEXT NOT NULL DEFAULT 'active',
+                    started_at               TIMESTAMPTZ DEFAULT now(),
+                    ends_at                  TIMESTAMPTZ NOT NULL,
+                    announcement_message_id  TEXT DEFAULT ''
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sprints_channel_status ON sprints (channel_id, status)")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS sprint_participants (
-                    sprint_id       INT NOT NULL REFERENCES sprints(id),
-                    user_id         TEXT NOT NULL,
-                    joined_at       TIMESTAMPTZ DEFAULT now(),
-                    progress_amount NUMERIC DEFAULT 0,
-                    reported        BOOLEAN DEFAULT FALSE,
+                    sprint_id          INT NOT NULL REFERENCES sprints(id),
+                    user_id            TEXT NOT NULL,
+                    joined_at          TIMESTAMPTZ DEFAULT now(),
+                    log_type           TEXT DEFAULT '',
+                    raw_amount         NUMERIC,
+                    pages_equivalent   NUMERIC,
+                    minutes_equivalent NUMERIC,
+                    reported           BOOLEAN DEFAULT FALSE,
                     PRIMARY KEY (sprint_id, user_id)
                 )
             """)
@@ -129,15 +155,14 @@ def init_postgres_schema():
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS scheduled_sprints (
-                    id                 SERIAL PRIMARY KEY,
-                    guild_id           TEXT NOT NULL,
-                    channel_id         TEXT NOT NULL,
-                    day_of_week        INT NOT NULL,
-                    time_utc           TEXT NOT NULL,
-                    duration_minutes   INT NOT NULL DEFAULT 20,
-                    goal_type          TEXT NOT NULL DEFAULT 'pages',
-                    created_by         TEXT NOT NULL,
-                    active             BOOLEAN NOT NULL DEFAULT TRUE,
+                    id                  SERIAL PRIMARY KEY,
+                    guild_id            TEXT NOT NULL,
+                    channel_id          TEXT NOT NULL,
+                    day_of_week         INT NOT NULL,
+                    time_utc            TEXT NOT NULL,
+                    duration_minutes    INT NOT NULL DEFAULT 20,
+                    created_by          TEXT NOT NULL,
+                    active              BOOLEAN NOT NULL DEFAULT TRUE,
                     last_triggered_date TEXT DEFAULT ''
                 )
             """)
@@ -217,8 +242,43 @@ def list_allowed_guilds() -> list[dict]:
         release_pg_connection(conn)
 
 
+# ===== GUILD SETTINGS HELPERS =====
+def get_guild_setting(guild_id: int, key: str, default: str = "") -> str:
+    conn = get_pg_connection()
+    if conn is None:
+        return default
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM guild_settings WHERE guild_id = %s AND key = %s", (str(guild_id), key))
+            row = cur.fetchone()
+            return row[0] if row else default
+    except Exception as error:
+        print("get_guild_setting error:", error)
+        return default
+    finally:
+        release_pg_connection(conn)
+
+
+def set_guild_setting(guild_id: int, key: str, value: str):
+    conn = get_pg_connection()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO guild_settings (guild_id, key, value) VALUES (%s, %s, %s)
+                ON CONFLICT (guild_id, key) DO UPDATE SET value = EXCLUDED.value
+            """, (str(guild_id), key, value))
+        conn.commit()
+    except Exception as error:
+        print("set_guild_setting error:", error)
+        conn.rollback()
+    finally:
+        release_pg_connection(conn)
+
+
 # ===== SPRINT DB HELPERS =====
-def db_create_sprint(guild_id: int, channel_id: int, host_id: int, goal_type: str, duration_minutes: int) -> int | None:
+def db_create_sprint(guild_id: int, channel_id: int, host_id: int, duration_minutes: int) -> int | None:
     conn = get_pg_connection()
     if conn is None:
         return None
@@ -226,9 +286,9 @@ def db_create_sprint(guild_id: int, channel_id: int, host_id: int, goal_type: st
         ends_at = now_utc() + timedelta(minutes=duration_minutes)
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO sprints (guild_id, channel_id, host_id, goal_type, duration_minutes, ends_at)
-                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
-            """, (str(guild_id), str(channel_id), str(host_id), goal_type, duration_minutes, ends_at))
+                INSERT INTO sprints (guild_id, channel_id, host_id, duration_minutes, ends_at)
+                VALUES (%s, %s, %s, %s, %s) RETURNING id
+            """, (str(guild_id), str(channel_id), str(host_id), duration_minutes, ends_at))
             sprint_id = cur.fetchone()[0]
             cur.execute("""
                 INSERT INTO sprint_participants (sprint_id, user_id) VALUES (%s, %s)
@@ -240,6 +300,21 @@ def db_create_sprint(guild_id: int, channel_id: int, host_id: int, goal_type: st
         print("db_create_sprint error:", error)
         conn.rollback()
         return None
+    finally:
+        release_pg_connection(conn)
+
+
+def db_set_sprint_message(sprint_id: int, message_id: int):
+    conn = get_pg_connection()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE sprints SET announcement_message_id = %s WHERE id = %s", (str(message_id), sprint_id))
+        conn.commit()
+    except Exception as error:
+        print("db_set_sprint_message error:", error)
+        conn.rollback()
     finally:
         release_pg_connection(conn)
 
@@ -307,8 +382,10 @@ def db_get_participants(sprint_id: int) -> list[dict]:
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT user_id, progress_amount, reported FROM sprint_participants
-                WHERE sprint_id = %s ORDER BY progress_amount DESC
+                SELECT user_id, log_type, raw_amount, pages_equivalent, minutes_equivalent, reported
+                FROM sprint_participants
+                WHERE sprint_id = %s
+                ORDER BY reported DESC, COALESCE(pages_equivalent, 0) DESC, joined_at ASC
             """, (sprint_id,))
             return list(cur.fetchall())
     except Exception as error:
@@ -340,19 +417,18 @@ def db_find_reportable_sprint(channel_id: int, user_id: int) -> dict | None:
         release_pg_connection(conn)
 
 
-def db_log_progress(sprint_id: int, user_id: int, amount: float, goal_type: str, guild_id: int):
+def db_log_progress(sprint_id: int, user_id: int, guild_id: int, log_type: str,
+                     raw_amount: float, pages_equivalent: float | None, minutes_equivalent: float | None):
     conn = get_pg_connection()
     if conn is None:
         return
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE sprint_participants SET progress_amount = %s, reported = TRUE
+                UPDATE sprint_participants
+                SET log_type = %s, raw_amount = %s, pages_equivalent = %s, minutes_equivalent = %s, reported = TRUE
                 WHERE sprint_id = %s AND user_id = %s
-            """, (amount, sprint_id, str(user_id)))
-
-            pages_delta = amount if goal_type == "pages" else 0
-            minutes_delta = amount if goal_type == "minutes" else 0
+            """, (log_type, raw_amount, pages_equivalent, minutes_equivalent, sprint_id, str(user_id)))
             cur.execute("""
                 INSERT INTO user_stats (guild_id, user_id, total_sprints, total_pages, total_minutes_read)
                 VALUES (%s, %s, 1, %s, %s)
@@ -360,7 +436,7 @@ def db_log_progress(sprint_id: int, user_id: int, amount: float, goal_type: str,
                     total_sprints = user_stats.total_sprints + 1,
                     total_pages = user_stats.total_pages + EXCLUDED.total_pages,
                     total_minutes_read = user_stats.total_minutes_read + EXCLUDED.total_minutes_read
-            """, (str(guild_id), str(user_id), pages_delta, minutes_delta))
+            """, (str(guild_id), str(user_id), pages_equivalent or 0, minutes_equivalent or 0))
         conn.commit()
     except Exception as error:
         print("db_log_progress error:", error)
@@ -439,7 +515,7 @@ def db_get_leaderboard(guild_id: int, metric: str, limit: int = 10) -> list[dict
 
 # ===== SCHEDULED SPRINT DB HELPERS =====
 def db_add_scheduled_sprint(guild_id: int, channel_id: int, day_of_week: int, time_utc: str,
-                             duration_minutes: int, goal_type: str, created_by: int) -> int | None:
+                             duration_minutes: int, created_by: int) -> int | None:
     conn = get_pg_connection()
     if conn is None:
         return None
@@ -447,9 +523,9 @@ def db_add_scheduled_sprint(guild_id: int, channel_id: int, day_of_week: int, ti
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO scheduled_sprints (guild_id, channel_id, day_of_week, time_utc,
-                    duration_minutes, goal_type, created_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
-            """, (str(guild_id), str(channel_id), day_of_week, time_utc, duration_minutes, goal_type, str(created_by)))
+                    duration_minutes, created_by)
+                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+            """, (str(guild_id), str(channel_id), day_of_week, time_utc, duration_minutes, str(created_by)))
             new_id = cur.fetchone()[0]
         conn.commit()
         return new_id
@@ -534,27 +610,28 @@ def db_mark_scheduled_triggered(schedule_id: int, today_str: str):
 
 
 # ===== EMBED BUILDERS =====
-def build_sprint_start_embed(host: discord.Member, goal_type: str, duration_minutes: int, ends_at: datetime) -> discord.Embed:
+def build_sprint_announcement_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
+    names = "\n".join(f"<@{p['user_id']}>" for p in participants) or "No one yet — be the first!"
     embed = discord.Embed(
         title="📖 Sprint started!",
         description=(
-            f"{host.mention} kicked off a **{duration_minutes}-minute** reading sprint.\n"
-            f"Goal: track your **{goal_type}** by the end.\n\n"
-            f"Use `/sprint join` to jump in any time before it ends."
+            f"Hosted by <@{sprint['host_id']}> — **{sprint['duration_minutes']} minutes** on the clock.\n"
+            f"Use `/sprint join` or the button below to jump in any time before it ends.\n\n"
+            f"When it ends, log your progress with the buttons on the results message."
         ),
         color=SPRINT_COLOR,
     )
-    embed.add_field(name="Ends", value=f"<t:{int(ends_at.timestamp())}:R>", inline=True)
+    embed.add_field(name="Ends", value=f"<t:{int(sprint['ends_at'].timestamp())}:R>", inline=True)
+    embed.add_field(name=f"Participants ({len(participants)})", value=names, inline=False)
     embed.set_footer(text="Sprintcadia")
     return embed
 
 
 def build_sprint_status_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
-    ends_at = sprint["ends_at"]
     lines = [f"<@{p['user_id']}>" for p in participants] or ["No one has joined yet."]
     embed = discord.Embed(
         title="⏱️ Sprint status",
-        description=f"Ends <t:{int(ends_at.timestamp())}:R>\nGoal type: **{sprint['goal_type']}**",
+        description=f"Ends <t:{int(sprint['ends_at'].timestamp())}:R>",
         color=SPRINT_COLOR,
     )
     embed.add_field(name=f"Participants ({len(participants)})", value="\n".join(lines), inline=False)
@@ -562,33 +639,62 @@ def build_sprint_status_embed(sprint: dict, participants: list[dict]) -> discord
     return embed
 
 
-def build_sprint_end_embed(sprint: dict) -> discord.Embed:
+def build_sprint_end_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
+    names = "\n".join(f"<@{p['user_id']}>" for p in participants) or "No one joined this one."
     embed = discord.Embed(
         title="⏰ Time's up!",
-        description=f"The {sprint['duration_minutes']}-minute sprint has ended. Report your progress with `/sprint done`.",
+        description=f"The {sprint['duration_minutes']}-minute sprint has ended. Tap a button below to log your progress.",
         color=RESULT_COLOR,
     )
+    embed.add_field(name="Participants", value=names, inline=False)
     embed.set_footer(text="Sprintcadia")
     return embed
 
 
-def build_sprint_results_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
-    goal_type = sprint["goal_type"]
+def _format_participant_line(p: dict) -> str:
+    uid = p["user_id"]
+    if not p["reported"]:
+        return f"<@{uid}> — no report yet"
+
+    log_type = p["log_type"]
+    raw = p["raw_amount"]
+    if log_type == "pages":
+        return f"<@{uid}> — **{float(raw):g} pages**"
+    if log_type == "percentage":
+        return f"<@{uid}> — **{float(raw):g}%** → **{float(p['pages_equivalent']):g} pages**"
+    if log_type == "audio":
+        return f"<@{uid}> — **{float(raw):g}%** listened → **{float(p['minutes_equivalent']):g} min**"
+    if log_type == "fanfic":
+        return f"<@{uid}> — **{float(raw):g} words** → **{float(p['pages_equivalent']):g} pages**"
+    return f"<@{uid}> — reported"
+
+
+def build_sprint_results_embed(participants: list[dict]) -> discord.Embed:
     reported = [p for p in participants if p["reported"]]
     unreported = [p for p in participants if not p["reported"]]
 
-    total = sum(float(p["progress_amount"]) for p in reported)
-    lines = [f"<@{p['user_id']}> — **{p['progress_amount']:g}** {goal_type}" for p in reported] or ["No one has reported yet."]
+    total_pages = sum(float(p["pages_equivalent"]) for p in reported if p["pages_equivalent"] is not None)
+    total_minutes = sum(float(p["minutes_equivalent"]) for p in reported if p["minutes_equivalent"] is not None)
 
     embed = discord.Embed(title="🏁 Sprint results", color=RESULT_COLOR)
-    embed.add_field(name="Reported", value="\n".join(lines), inline=False)
+    embed.add_field(
+        name="Reported",
+        value="\n".join(_format_participant_line(p) for p in reported) or "No one has reported yet.",
+        inline=False,
+    )
     if unreported:
         embed.add_field(
             name="Still waiting on",
             value="\n".join(f"<@{p['user_id']}>" for p in unreported),
             inline=False,
         )
-    embed.add_field(name=f"Group total ({goal_type})", value=f"**{total:g}**", inline=False)
+
+    totals = []
+    if total_pages:
+        totals.append(f"**{total_pages:g} pages**")
+    if total_minutes:
+        totals.append(f"**{total_minutes:g} minutes** of audio")
+    embed.add_field(name="Group total", value=" and ".join(totals) if totals else "No progress logged yet.", inline=False)
     embed.set_footer(text="Sprintcadia")
     return embed
 
@@ -626,6 +732,171 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 active_sprint_tasks: dict[int, asyncio.Task] = {}
 
 
+async def apply_log(interaction: discord.Interaction, log_type: str, raw_amount: float,
+                     pages_equivalent: float | None, minutes_equivalent: float | None, confirm_text: str):
+    sprint = await run_blocking(db_find_reportable_sprint, interaction.channel_id, interaction.user.id)
+    if sprint is None:
+        embed = discord.Embed(
+            description="No open sprint here for you to report on — join one with `/sprint join`, "
+                        "or you may have already reported for this one.",
+            color=ALERT_COLOR,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    await run_blocking(db_log_progress, sprint["id"], interaction.user.id, interaction.guild_id,
+                        log_type, raw_amount, pages_equivalent, minutes_equivalent)
+    await interaction.response.send_message(confirm_text, ephemeral=True)
+
+
+async def handle_join(interaction: discord.Interaction):
+    sprint = await run_blocking(db_get_active_sprint, interaction.channel_id)
+    if sprint is None:
+        await interaction.response.send_message(
+            embed=discord.Embed(description="No active sprint here. Start one with `/sprint start`.", color=ALERT_COLOR),
+            ephemeral=True,
+        )
+        return
+    joined = await run_blocking(db_join_sprint, sprint["id"], interaction.user.id)
+    if joined:
+        await interaction.response.send_message(f"✅ {interaction.user.mention} joined the sprint!")
+        await refresh_sprint_announcement(sprint["id"])
+    else:
+        await interaction.response.send_message("You're already in this sprint.", ephemeral=True)
+
+
+async def refresh_sprint_announcement(sprint_id: int):
+    sprint = await run_blocking(db_get_sprint, sprint_id)
+    if sprint is None or not sprint.get("announcement_message_id"):
+        return
+    channel = bot.get_channel(int(sprint["channel_id"]))
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(int(sprint["announcement_message_id"]))
+    except discord.HTTPException:
+        return
+    participants = await run_blocking(db_get_participants, sprint_id)
+    try:
+        await message.edit(embed=build_sprint_announcement_embed(sprint, participants))
+    except discord.HTTPException:
+        pass
+
+
+# ===== LOG MODALS (triggered by buttons on the sprint-end message) =====
+class LogPagesModal(discord.ui.Modal, title="Log Pages"):
+    pages_input = discord.ui.TextInput(label="Pages read this sprint", placeholder="e.g. 42", max_length=6)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        value = _parse_int(self.pages_input.value)
+        if value is None or value <= 0:
+            await interaction.response.send_message(
+                embed=discord.Embed(description="Enter a whole number of pages greater than 0.", color=ALERT_COLOR),
+                ephemeral=True,
+            )
+            return
+        await apply_log(interaction, "pages", float(value), float(value), None, f"📗 Logged **{value} pages**.")
+
+
+class LogPercentageModal(discord.ui.Modal, title="Log Ebook Progress"):
+    percent_input = discord.ui.TextInput(label="Percent of book read this sprint", placeholder="e.g. 12.5")
+    total_pages_input = discord.ui.TextInput(label="Book's total page count", placeholder="e.g. 320")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        percent = _parse_float(self.percent_input.value)
+        total_pages = _parse_int(self.total_pages_input.value)
+        if percent is None or not (0 < percent <= 100) or total_pages is None or total_pages <= 0:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="Enter a percent between 0-100 and a total page count greater than 0.",
+                    color=ALERT_COLOR,
+                ),
+                ephemeral=True,
+            )
+            return
+        pages = round(percent / 100 * total_pages, 1)
+        await apply_log(
+            interaction, "percentage", percent, pages, None,
+            f"📗 Logged **{percent:g}%** of a {total_pages}-page book → **{pages:g} pages**.",
+        )
+
+
+class LogAudioModal(discord.ui.Modal, title="Log Audiobook Progress"):
+    percent_input = discord.ui.TextInput(label="Percent listened this sprint", placeholder="e.g. 8")
+    hours_input = discord.ui.TextInput(label="Audiobook total length — hours", placeholder="e.g. 8", required=False, default="0")
+    minutes_input = discord.ui.TextInput(label="Audiobook total length — minutes", placeholder="e.g. 30", required=False, default="0")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        percent = _parse_float(self.percent_input.value)
+        hours = _parse_int(self.hours_input.value) or 0
+        minutes = _parse_int(self.minutes_input.value) or 0
+        total_minutes = hours * 60 + minutes
+        if percent is None or not (0 < percent <= 100) or total_minutes <= 0:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="Enter a percent between 0-100 and the audiobook's total length.",
+                    color=ALERT_COLOR,
+                ),
+                ephemeral=True,
+            )
+            return
+        listened = round(percent / 100 * total_minutes, 1)
+        await apply_log(
+            interaction, "audio", percent, None, listened,
+            f"🎧 Logged **{percent:g}%** of a {hours}h{minutes}m audiobook → **{listened:g} min**.",
+        )
+
+
+class LogFanficModal(discord.ui.Modal, title="Log Fanfic Words"):
+    words_input = discord.ui.TextInput(label="Words read this sprint", placeholder="e.g. 1500")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        words = _parse_int(self.words_input.value)
+        if words is None or words <= 0:
+            await interaction.response.send_message(
+                embed=discord.Embed(description="Enter a whole number of words greater than 0.", color=ALERT_COLOR),
+                ephemeral=True,
+            )
+            return
+        pages = round(words / FANFIC_WORDS_PER_PAGE, 1)
+        await apply_log(
+            interaction, "fanfic", float(words), pages, None,
+            f"✍️ Logged **{words:,} words** → **{pages:g} pages**.",
+        )
+
+
+# ===== PERSISTENT VIEWS =====
+class SprintJoinView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🏁 Join Sprint", style=discord.ButtonStyle.green, custom_id="sprintcadia:join_sprint")
+    async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_join(interaction)
+
+
+class SprintLogView(discord.ui.View):
+    """Attached to the sprint-end message — this is the only way to log progress; there's no slash command for it."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="📖 Pages", style=discord.ButtonStyle.blurple, custom_id="sprintcadia:log_pages")
+    async def log_pages_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LogPagesModal())
+
+    @discord.ui.button(label="📊 Ebook %", style=discord.ButtonStyle.blurple, custom_id="sprintcadia:log_percentage")
+    async def log_percentage_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LogPercentageModal())
+
+    @discord.ui.button(label="🎧 Audiobook", style=discord.ButtonStyle.blurple, custom_id="sprintcadia:log_audio")
+    async def log_audio_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LogAudioModal())
+
+    @discord.ui.button(label="✍️ Fanfic", style=discord.ButtonStyle.blurple, custom_id="sprintcadia:log_fanfic")
+    async def log_fanfic_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LogFanficModal())
+
+
 async def finish_sprint(sprint_id: int):
     """Waits out the remaining sprint time, then posts results and closes it out."""
     sprint = await run_blocking(db_get_sprint, sprint_id)
@@ -645,24 +916,43 @@ async def finish_sprint(sprint_id: int):
     channel = bot.get_channel(int(sprint["channel_id"]))
     if channel is None:
         return
+    participants = await run_blocking(db_get_participants, sprint_id)
+    mentions = " ".join(f"<@{p['user_id']}>" for p in participants)
     try:
-        await channel.send(embed=build_sprint_end_embed(sprint))
+        await channel.send(
+            content=mentions or None,
+            embed=build_sprint_end_embed(sprint, participants),
+            view=SprintLogView(),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
     except discord.HTTPException as error:
         print("Failed to post sprint end embed:", error)
 
 
-async def start_sprint(guild_id: int, channel: discord.abc.Messageable, host: discord.Member,
-                        goal_type: str, duration_minutes: int) -> bool:
+async def start_sprint(guild_id: int, channel: discord.abc.Messageable, host_id: int, duration_minutes: int) -> bool:
     existing = await run_blocking(db_get_active_sprint, channel.id)
     if existing is not None:
         return False
 
-    sprint_id = await run_blocking(db_create_sprint, guild_id, channel.id, host.id, goal_type, duration_minutes)
+    sprint_id = await run_blocking(db_create_sprint, guild_id, channel.id, host_id, duration_minutes)
     if sprint_id is None:
         return False
 
     sprint = await run_blocking(db_get_sprint, sprint_id)
-    await channel.send(embed=build_sprint_start_embed(host, goal_type, duration_minutes, sprint["ends_at"]))
+    participants = await run_blocking(db_get_participants, sprint_id)
+
+    role_id = await run_blocking(get_guild_setting, guild_id, SPRINT_ROLE_SETTING_KEY, "")
+    content = f"<@&{role_id}>" if role_id else None
+    allowed = discord.AllowedMentions(roles=True, users=False, everyone=False) if role_id else discord.AllowedMentions.none()
+
+    message = await channel.send(
+        content=content,
+        embed=build_sprint_announcement_embed(sprint, participants),
+        view=SprintJoinView(),
+        allowed_mentions=allowed,
+    )
+    await run_blocking(db_set_sprint_message, sprint_id, message.id)
+
     active_sprint_tasks[sprint_id] = bot.loop.create_task(finish_sprint(sprint_id))
     return True
 
@@ -672,11 +962,9 @@ sprint_group = app_commands.Group(name="sprint", description="Run a reading spri
 
 
 @sprint_group.command(name="start", description="Start a reading sprint in this channel.")
-@app_commands.describe(duration_minutes="How long the sprint runs, in minutes", goal_type="What participants will report at the end")
-@app_commands.choices(goal_type=GOAL_TYPE_CHOICES)
-async def sprint_start(interaction: discord.Interaction, duration_minutes: app_commands.Range[int, 1, 180],
-                        goal_type: app_commands.Choice[str]):
-    started = await start_sprint(interaction.guild_id, interaction.channel, interaction.user, goal_type.value, duration_minutes)
+@app_commands.describe(duration_minutes="How long the sprint runs, in minutes")
+async def sprint_start(interaction: discord.Interaction, duration_minutes: app_commands.Range[int, 1, 180]):
+    started = await start_sprint(interaction.guild_id, interaction.channel, interaction.user.id, duration_minutes)
     if not started:
         await interaction.response.send_message(
             embed=discord.Embed(description="⚠️ There's already an active sprint in this channel.", color=ALERT_COLOR),
@@ -688,18 +976,7 @@ async def sprint_start(interaction: discord.Interaction, duration_minutes: app_c
 
 @sprint_group.command(name="join", description="Join the active sprint in this channel.")
 async def sprint_join(interaction: discord.Interaction):
-    sprint = await run_blocking(db_get_active_sprint, interaction.channel_id)
-    if sprint is None:
-        await interaction.response.send_message(
-            embed=discord.Embed(description="No active sprint here. Start one with `/sprint start`.", color=ALERT_COLOR),
-            ephemeral=True,
-        )
-        return
-    joined = await run_blocking(db_join_sprint, sprint["id"], interaction.user.id)
-    if joined:
-        await interaction.response.send_message(f"✅ {interaction.user.mention} joined the sprint!")
-    else:
-        await interaction.response.send_message("You're already in this sprint.", ephemeral=True)
+    await handle_join(interaction)
 
 
 @sprint_group.command(name="status", description="Show the active sprint's time remaining and participants.")
@@ -714,20 +991,6 @@ async def sprint_status(interaction: discord.Interaction):
     await interaction.response.send_message(embed=build_sprint_status_embed(sprint, participants))
 
 
-@sprint_group.command(name="done", description="Report your progress for the sprint you joined.")
-@app_commands.describe(amount="How many pages/minutes you got through")
-async def sprint_done(interaction: discord.Interaction, amount: app_commands.Range[float, 0, None]):
-    sprint = await run_blocking(db_find_reportable_sprint, interaction.channel_id, interaction.user.id)
-    if sprint is None:
-        await interaction.response.send_message(
-            embed=discord.Embed(description="No sprint here for you to report progress on.", color=ALERT_COLOR),
-            ephemeral=True,
-        )
-        return
-    await run_blocking(db_log_progress, sprint["id"], interaction.user.id, amount, sprint["goal_type"], interaction.guild_id)
-    await interaction.response.send_message(f"📗 Logged **{amount:g} {sprint['goal_type']}** for {interaction.user.mention}.")
-
-
 @sprint_group.command(name="results", description="Show results for the most recent sprint in this channel.")
 async def sprint_results(interaction: discord.Interaction):
     sprint = await run_blocking(db_get_active_sprint, interaction.channel_id)
@@ -740,10 +1003,10 @@ async def sprint_results(interaction: discord.Interaction):
         )
         return
     participants = await run_blocking(db_get_participants, sprint["id"])
-    await interaction.response.send_message(embed=build_sprint_results_embed(sprint, participants))
+    await interaction.response.send_message(embed=build_sprint_results_embed(participants))
 
 
-@sprint_group.command(name="cancel", description="Cancel the active sprint in this channel.")
+@sprint_group.command(name="cancel", description="Admin/host only: cancel the active sprint in this channel.")
 async def sprint_cancel(interaction: discord.Interaction):
     sprint = await run_blocking(db_get_active_sprint, interaction.channel_id)
     if sprint is None:
@@ -768,6 +1031,21 @@ async def sprint_cancel(interaction: discord.Interaction):
     await interaction.response.send_message(
         embed=discord.Embed(description="🛑 Sprint cancelled.", color=ALERT_COLOR),
     )
+
+
+@sprint_group.command(name="set-role", description="Admin only: role to ping when a sprint starts.")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(role="Role to ping whenever a sprint starts in this server")
+async def sprint_set_role(interaction: discord.Interaction, role: discord.Role):
+    await run_blocking(set_guild_setting, interaction.guild_id, SPRINT_ROLE_SETTING_KEY, str(role.id))
+    await interaction.response.send_message(f"✅ Sprints will now ping {role.mention} when they start.", ephemeral=True)
+
+
+@sprint_group.command(name="clear-role", description="Admin only: stop pinging a role when sprints start.")
+@app_commands.checks.has_permissions(administrator=True)
+async def sprint_clear_role(interaction: discord.Interaction):
+    await run_blocking(set_guild_setting, interaction.guild_id, SPRINT_ROLE_SETTING_KEY, "")
+    await interaction.response.send_message("✅ Sprints will no longer ping a role when they start.", ephemeral=True)
 
 
 bot.tree.add_command(sprint_group)
@@ -805,11 +1083,10 @@ schedule_group = app_commands.Group(name="schedule", description="Manage recurri
     day="Day of week (UTC)",
     time_utc="Time in 24h UTC, e.g. 18:00",
     duration_minutes="Sprint length in minutes",
-    goal_type="What participants report at the end",
 )
-@app_commands.choices(day=WEEKDAY_CHOICES, goal_type=GOAL_TYPE_CHOICES)
+@app_commands.choices(day=WEEKDAY_CHOICES)
 async def schedule_add(interaction: discord.Interaction, channel: discord.TextChannel, day: app_commands.Choice[int],
-                        time_utc: str, duration_minutes: app_commands.Range[int, 1, 180], goal_type: app_commands.Choice[str]):
+                        time_utc: str, duration_minutes: app_commands.Range[int, 1, 180]):
     if not _valid_time_str(time_utc):
         await interaction.response.send_message(
             embed=discord.Embed(description="⚠️ Time must be in 24h `HH:MM` format, e.g. `18:00`.", color=ALERT_COLOR),
@@ -817,7 +1094,7 @@ async def schedule_add(interaction: discord.Interaction, channel: discord.TextCh
         )
         return
     await run_blocking(db_add_scheduled_sprint, interaction.guild_id, channel.id, day.value, time_utc,
-                       duration_minutes, goal_type.value, interaction.user.id)
+                       duration_minutes, interaction.user.id)
     await interaction.response.send_message(
         f"✅ Scheduled a {duration_minutes}-minute sprint in {channel.mention} every "
         f"**{WEEKDAY_NAMES[day.value]} at {time_utc} UTC**."
@@ -832,8 +1109,7 @@ async def schedule_list(interaction: discord.Interaction):
         await interaction.response.send_message("No scheduled sprints set up yet.", ephemeral=True)
         return
     lines = [
-        f"`#{r['id']}` <#{r['channel_id']}> — {WEEKDAY_NAMES[r['day_of_week']]} {r['time_utc']} UTC, "
-        f"{r['duration_minutes']}min, {r['goal_type']}"
+        f"`#{r['id']}` <#{r['channel_id']}> — {WEEKDAY_NAMES[r['day_of_week']]} {r['time_utc']} UTC, {r['duration_minutes']}min"
         for r in rows
     ]
     embed = discord.Embed(title="📅 Scheduled sprints", description="\n".join(lines), color=SPRINT_COLOR)
@@ -921,12 +1197,10 @@ async def scheduled_sprint_loop():
     for row in due:
         await run_blocking(db_mark_scheduled_triggered, row["id"], today_str)
         channel = bot.get_channel(int(row["channel_id"]))
-        guild = bot.get_guild(int(row["guild_id"]))
-        if channel is None or guild is None:
+        if channel is None:
             continue
-        host = guild.me
         try:
-            await start_sprint(int(row["guild_id"]), channel, host, row["goal_type"], row["duration_minutes"])
+            await start_sprint(int(row["guild_id"]), channel, bot.user.id, row["duration_minutes"])
         except Exception as error:
             print("scheduled_sprint_loop start_sprint error:", error)
 
@@ -981,6 +1255,10 @@ async def on_ready():
         if not await run_blocking(is_guild_allowed, guild.id):
             print(f"Leaving unapproved guild found on startup: {guild.name} ({guild.id})")
             await guild.leave()
+
+    # Persistent views need to be re-registered every time the bot restarts.
+    bot.add_view(SprintJoinView())
+    bot.add_view(SprintLogView())
 
     # Re-arm timers for sprints that were still running when the bot last restarted.
     active_sprints = await run_blocking(db_get_all_active_sprints)
