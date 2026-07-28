@@ -23,7 +23,32 @@ FANFIC_WORDS_PER_PAGE = 250
 
 SPRINT_ROLE_SETTING_KEY = "Sprint Ping Role ID"
 
-LOG_TYPE_ICONS = {"pages": "📖", "percentage": "📊", "audio": "🎧", "fanfic": "✍️"}
+# ===== CUSTOM APPLICATION EMOJIS (uploaded to the bot itself in the Dev Portal) =====
+EMOJI_TIMER = "<:timer:1531488929201524958>"
+EMOJI_SPRINTING = "<:sprinting:1531488927750422578>"
+EMOJI_QUILL = "<:quill:1531488926831738890>"
+EMOJI_PIN = "<:pin:1531488925686693888>"
+EMOJI_PHOENIXICON = "<:phoenixicon:1531488924961214515>"
+EMOJI_PHOENIX = "<:phoenix:1531488924113830023>"
+EMOJI_PERCENTAGE = "<:percentage:1531488922650022019>"
+EMOJI_PAGE = "<:page:1531488921782063134>"
+EMOJI_OPENBOOK = "<:openbook:1531488920393486426>"
+EMOJI_LOG = "<:log:1531488919600890017>"
+EMOJI_HOURGLASS = "<:hourglass:1531488918674079804>"
+EMOJI_EBOOK = "<:ebook:1531488917545681027>"
+EMOJI_BOOKSTACK = "<:bookstack:1531488916685983774>"
+EMOJI_BOOK = "<:book:1531488915876352070>"
+EMOJI_AUDIOBOOK = "<:audiobook:1531488915100401735>"
+EMOJI_FIRE = "<:fire:1531488913871474809>"
+
+PHOENIX_FOOTER_ICON_URL = "https://cdn.discordapp.com/emojis/1531488924961214515.png"
+
+
+def _set_footer(embed: discord.Embed):
+    embed.set_footer(text="Sprintcadia", icon_url=PHOENIX_FOOTER_ICON_URL)
+
+
+LOG_TYPE_ICONS = {"pages": EMOJI_PAGE, "percentage": EMOJI_PERCENTAGE, "audio": EMOJI_AUDIOBOOK, "fanfic": EMOJI_QUILL}
 LOG_TYPE_LABELS = {"pages": "Pages", "percentage": "Ebook %", "audio": "Audiobook", "fanfic": "Fanfic"}
 
 JOIN_LOG_TYPE_CHOICES = [
@@ -639,44 +664,44 @@ def db_mark_scheduled_triggered(schedule_id: int, today_str: str):
 
 # ===== EMBED BUILDERS =====
 def _participant_line(p: dict) -> str:
-    icon = LOG_TYPE_ICONS.get(p.get("log_type"), "📚")
+    icon = LOG_TYPE_ICONS.get(p.get("log_type"), EMOJI_OPENBOOK)
     title = f" — reading *{p['book_title']}*" if p.get("book_title") else ""
     return f"{icon} <@{p['user_id']}>{title}"
 
 
 def build_sprint_announcement_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
     names = "\n".join(_participant_line(p) for p in participants) or "No one yet — be the first!"
-    embed = discord.Embed(title="📖 Reading sprint!", color=SPRINT_COLOR)
-    embed.add_field(name="Duration", value=f"{sprint['duration_minutes']} min", inline=True)
-    embed.add_field(name="Starts", value=f"<t:{int(sprint['started_at'].timestamp())}:R>", inline=True)
-    embed.add_field(name="Ends", value=f"<t:{int(sprint['ends_at'].timestamp())}:R>", inline=True)
-    embed.add_field(name=f"Participants ({len(participants)})", value=names, inline=False)
-    embed.add_field(name="Host", value=f"<@{sprint['host_id']}>", inline=False)
-    embed.set_footer(text="Sprintcadia")
+    embed = discord.Embed(title=f"{EMOJI_FIRE} Sprint ignited!", color=SPRINT_COLOR)
+    embed.add_field(name=f"{EMOJI_TIMER} Duration", value=f"{sprint['duration_minutes']} min", inline=True)
+    embed.add_field(name=f"{EMOJI_HOURGLASS} Starts", value=f"<t:{int(sprint['started_at'].timestamp())}:R>", inline=True)
+    embed.add_field(name=f"{EMOJI_HOURGLASS} Ends", value=f"<t:{int(sprint['ends_at'].timestamp())}:R>", inline=True)
+    embed.add_field(name=f"{EMOJI_BOOKSTACK} Participants ({len(participants)})", value=names, inline=False)
+    embed.add_field(name=f"{EMOJI_PHOENIXICON} Host", value=f"<@{sprint['host_id']}>", inline=False)
+    _set_footer(embed)
     return embed
 
 
 def build_sprint_status_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
     lines = [_participant_line(p) for p in participants] or ["No one has joined yet."]
     embed = discord.Embed(
-        title="⏱️ Sprint status",
+        title=f"{EMOJI_TIMER} Sprint status",
         description=f"Ends <t:{int(sprint['ends_at'].timestamp())}:R>",
         color=SPRINT_COLOR,
     )
-    embed.add_field(name=f"Participants ({len(participants)})", value="\n".join(lines), inline=False)
-    embed.set_footer(text="Sprintcadia")
+    embed.add_field(name=f"{EMOJI_BOOKSTACK} Participants ({len(participants)})", value="\n".join(lines), inline=False)
+    _set_footer(embed)
     return embed
 
 
 def build_sprint_end_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
     names = "\n".join(_participant_line(p) for p in participants) or "No one joined this one."
     embed = discord.Embed(
-        title="⏰ Sprint ended — log your progress!",
+        title=f"{EMOJI_PHOENIX} Sprint complete — rise & report!",
         description=f"The {sprint['duration_minutes']}-minute sprint is over. Tap **Log Sprint** below.",
         color=RESULT_COLOR,
     )
-    embed.add_field(name="Participants", value=names, inline=False)
-    embed.set_footer(text="Sprintcadia")
+    embed.add_field(name=f"{EMOJI_BOOKSTACK} Participants", value=names, inline=False)
+    _set_footer(embed)
     return embed
 
 
@@ -706,7 +731,7 @@ def build_sprint_results_embed(participants: list[dict]) -> discord.Embed:
     total_pages = sum(float(p["pages_equivalent"]) for p in reported if p["pages_equivalent"] is not None)
     total_minutes = sum(float(p["minutes_equivalent"]) for p in reported if p["minutes_equivalent"] is not None)
 
-    embed = discord.Embed(title="🏁 Sprint results", color=RESULT_COLOR)
+    embed = discord.Embed(title=f"{EMOJI_PHOENIXICON} Sprint results", color=RESULT_COLOR)
     embed.add_field(
         name="Reported",
         value="\n".join(_format_result_line(p) for p in reported) or "No one has reported yet.",
@@ -724,22 +749,22 @@ def build_sprint_results_embed(participants: list[dict]) -> discord.Embed:
         totals.append(f"**{total_pages:g} pages**")
     if total_minutes:
         totals.append(f"**{total_minutes:g} minutes** of audio")
-    embed.add_field(name="Group total", value=" and ".join(totals) if totals else "No progress logged yet.", inline=False)
-    embed.set_footer(text="Sprintcadia")
+    embed.add_field(name=f"{EMOJI_FIRE} Group total", value=" and ".join(totals) if totals else "No progress logged yet.", inline=False)
+    _set_footer(embed)
     return embed
 
 
 def build_stats_embed(member: discord.abc.User, stats: dict) -> discord.Embed:
-    embed = discord.Embed(title=f"📊 {member.display_name}'s stats", color=SPRINT_COLOR)
-    embed.add_field(name="Sprints completed", value=str(stats["total_sprints"]), inline=True)
-    embed.add_field(name="Total pages", value=f"{float(stats['total_pages']):g}", inline=True)
-    embed.add_field(name="Total minutes", value=f"{float(stats['total_minutes_read']):g}", inline=True)
-    embed.set_footer(text="Sprintcadia")
+    embed = discord.Embed(title=f"{EMOJI_PHOENIXICON} {member.display_name}'s stats", color=SPRINT_COLOR)
+    embed.add_field(name=f"{EMOJI_SPRINTING} Sprints completed", value=str(stats["total_sprints"]), inline=True)
+    embed.add_field(name=f"{EMOJI_PAGE} Total pages", value=f"{float(stats['total_pages']):g}", inline=True)
+    embed.add_field(name=f"{EMOJI_AUDIOBOOK} Total minutes", value=f"{float(stats['total_minutes_read']):g}", inline=True)
+    _set_footer(embed)
     return embed
 
 
 def build_leaderboard_embed(guild_name: str, metric: str, rows: list[dict]) -> discord.Embed:
-    embed = discord.Embed(title=f"🏆 {guild_name} leaderboard — {metric}", color=SPRINT_COLOR)
+    embed = discord.Embed(title=f"{EMOJI_FIRE} {guild_name} leaderboard — {metric}", color=SPRINT_COLOR)
     if not rows:
         embed.description = "No sprint data yet."
         return embed
@@ -751,7 +776,7 @@ def build_leaderboard_embed(guild_name: str, metric: str, rows: list[dict]) -> d
         unit = "pages" if metric == "pages" else "sprints"
         lines.append(f"{prefix} <@{row['user_id']}> — **{float(value):g}** {unit}")
     embed.description = "\n".join(lines)
-    embed.set_footer(text="Sprintcadia")
+    _set_footer(embed)
     return embed
 
 
@@ -848,7 +873,7 @@ class LogPagesModal(discord.ui.Modal, title="Log Pages"):
                 ephemeral=True,
             )
             return
-        await apply_log(interaction, "pages", float(value), float(value), None, f"📗 Logged **{value} pages**.")
+        await apply_log(interaction, "pages", float(value), float(value), None, f"{EMOJI_PAGE} Logged **{value} pages**.")
 
 
 class LogPercentageModal(discord.ui.Modal, title="Log Ebook Progress"):
@@ -870,7 +895,7 @@ class LogPercentageModal(discord.ui.Modal, title="Log Ebook Progress"):
         pages = round(percent / 100 * total_pages, 1)
         await apply_log(
             interaction, "percentage", percent, pages, None,
-            f"📗 Logged **{percent:g}%** of a {total_pages}-page book → **{pages:g} pages**.",
+            f"{EMOJI_EBOOK} Logged **{percent:g}%** of a {total_pages}-page book → **{pages:g} pages**.",
         )
 
 
@@ -896,7 +921,7 @@ class LogAudioModal(discord.ui.Modal, title="Log Audiobook Progress"):
         listened = round(percent / 100 * total_minutes, 1)
         await apply_log(
             interaction, "audio", percent, None, listened,
-            f"🎧 Logged **{percent:g}%** of a {hours}h{minutes}m audiobook → **{listened:g} min**.",
+            f"{EMOJI_AUDIOBOOK} Logged **{percent:g}%** of a {hours}h{minutes}m audiobook → **{listened:g} min**.",
         )
 
 
@@ -914,7 +939,7 @@ class LogFanficModal(discord.ui.Modal, title="Log Fanfic Words"):
         pages = round(words / FANFIC_WORDS_PER_PAGE, 1)
         await apply_log(
             interaction, "fanfic", float(words), pages, None,
-            f"✍️ Logged **{words:,} words** → **{pages:g} pages**.",
+            f"{EMOJI_QUILL} Logged **{words:,} words** → **{pages:g} pages**.",
         )
 
 
@@ -941,10 +966,10 @@ class JoinDetailsModal(discord.ui.Modal, title="Join Sprint"):
 class JoinTypeSelect(discord.ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(label="Pages", value="pages", emoji="📖", description="Track by page number"),
-            discord.SelectOption(label="Ebook %", value="percentage", emoji="📊", description="Track by percent complete (e.g. Kindle)"),
-            discord.SelectOption(label="Audiobook", value="audio", emoji="🎧", description="Track by percent listened"),
-            discord.SelectOption(label="Fanfic", value="fanfic", emoji="✍️", description="Track by word count"),
+            discord.SelectOption(label="Pages", value="pages", emoji=EMOJI_PAGE, description="Track by page number"),
+            discord.SelectOption(label="Ebook %", value="percentage", emoji=EMOJI_EBOOK, description="Track by percent complete (e.g. Kindle)"),
+            discord.SelectOption(label="Audiobook", value="audio", emoji=EMOJI_AUDIOBOOK, description="Track by percent listened"),
+            discord.SelectOption(label="Fanfic", value="fanfic", emoji=EMOJI_QUILL, description="Track by word count"),
         ]
         super().__init__(placeholder="How are you tracking this sprint?", options=options)
 
@@ -966,13 +991,13 @@ class SprintJoinView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="🏁 Join Sprint", style=discord.ButtonStyle.green, custom_id="sprintcadia:join_sprint")
+    @discord.ui.button(label="Join Sprint", emoji=EMOJI_SPRINTING, style=discord.ButtonStyle.green, custom_id="sprintcadia:join_sprint")
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
             "How are you tracking this sprint?", view=JoinTypeSelectView(), ephemeral=True,
         )
 
-    @discord.ui.button(label="🔄 Update Progress", style=discord.ButtonStyle.grey, custom_id="sprintcadia:update_progress")
+    @discord.ui.button(label="Update Progress", emoji=EMOJI_LOG, style=discord.ButtonStyle.grey, custom_id="sprintcadia:update_progress")
     async def update_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await open_log_modal_for_user(interaction)
 
@@ -983,7 +1008,7 @@ class SprintLogButtonView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="📝 Log Sprint", style=discord.ButtonStyle.blurple, custom_id="sprintcadia:log_sprint")
+    @discord.ui.button(label="Log Sprint", emoji=EMOJI_LOG, style=discord.ButtonStyle.blurple, custom_id="sprintcadia:log_sprint")
     async def log_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await open_log_modal_for_user(interaction)
 
