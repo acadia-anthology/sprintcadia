@@ -950,14 +950,19 @@ def _relative_and_clock(dt: datetime) -> str:
 
 
 def build_sprint_announcement_embed(sprint: dict) -> discord.Embed:
-    """Duration/Starts/Ends stay as native embed fields so Discord's <t:...:R> timestamps
-    keep auto-updating for free; host + participants are rendered into a Pillow card
-    (see build_sprint_card_file) attached to the same message as a plain image, outside
-    the embed's border, rather than via embed.set_image()."""
-    embed = discord.Embed(title=f"{EMOJI_FIRE} Sprint ignited!", color=BRAND_COLOR)
-    embed.add_field(name=f"{EMOJI_TIMER} Duration", value=f"{sprint['duration_minutes']} min", inline=True)
-    embed.add_field(name=f"{EMOJI_HOURGLASS} Starts", value=_relative_and_clock(sprint["started_at"]), inline=True)
-    embed.add_field(name=f"{EMOJI_HOURGLASS} Ends", value=_relative_and_clock(sprint["ends_at"]), inline=True)
+    """Duration/Starts/Ends are one stacked line each (not side-by-side fields) so
+    Discord's <t:...:R> timestamps keep auto-updating for free; host + participants are
+    rendered into a Pillow card (see build_sprint_card_file) attached to the same message
+    as a plain image, outside the embed's border, rather than via embed.set_image()."""
+    embed = discord.Embed(
+        title=f"{EMOJI_FIRE} Sprint ignited!",
+        description=(
+            f"{EMOJI_TIMER} **Duration:** {sprint['duration_minutes']} min\n"
+            f"{EMOJI_HOURGLASS} **Starts:** <t:{int(sprint['started_at'].timestamp())}:R>\n"
+            f"{EMOJI_QUILL} **Ends:** <t:{int(sprint['ends_at'].timestamp())}:R>"
+        ),
+        color=BRAND_COLOR,
+    )
     _set_footer(embed)
     return embed
 
@@ -1548,7 +1553,8 @@ async def start_sprint(guild_id: int, channel: discord.abc.Messageable, host_id:
     participants = await run_blocking(db_get_participants, sprint_id)
 
     role_id = await run_blocking(get_guild_setting, guild_id, SPRINT_ROLE_SETTING_KEY, "")
-    content = f"<@&{role_id}>" if role_id else None
+    announce_text = f"a new sprint has ignited! {EMOJI_FIRE}"
+    content = f"<@&{role_id}> {announce_text}" if role_id else announce_text
     allowed = discord.AllowedMentions(roles=True, users=False, everyone=False) if role_id else discord.AllowedMentions.none()
 
     card_file = None
