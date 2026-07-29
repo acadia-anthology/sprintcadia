@@ -1,10 +1,13 @@
 import asyncio
+import io
 import os
 from datetime import datetime, timedelta, timezone
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from PIL import Image, ImageDraw, ImageFont
 import psycopg2
 import psycopg2.pool
 import psycopg2.extras
@@ -47,6 +50,179 @@ PHOENIX_FOOTER_ICON_URL = "https://cdn.discordapp.com/emojis/1531488924961214515
 
 def _set_footer(embed: discord.Embed):
     embed.set_footer(text="Sprintcadia", icon_url=PHOENIX_FOOTER_ICON_URL)
+
+
+# ===== SPRINT CARD (Pillow-rendered participant image for the announcement) =====
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+FONT_BOLD_PATH = os.path.join(FONT_DIR, "LiberationSans-Bold.ttf")
+FONT_REGULAR_PATH = os.path.join(FONT_DIR, "LiberationSans-Regular.ttf")
+
+CARD_WIDTH = 680
+CARD_ROW_HEIGHT = 74
+CARD_PADDING = 24
+CARD_AVATAR_SIZE = 56
+CARD_TOP_COLOR = (16, 42, 45)     # dark teal, matches SPRINT_COLOR
+CARD_BOTTOM_COLOR = (60, 24, 12)  # dark ember, matches RESULT_COLOR
+
+_http_session: aiohttp.ClientSession | None = None
+_image_cache: dict[str, Image.Image] = {}
+
+
+async def _get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session
+
+
+def _emoji_cdn_url(emoji_str: str) -> str:
+    emoji_id = emoji_str.rstrip(">").rsplit(":", 1)[-1]
+    return f"https://cdn.discordapp.com/emojis/{emoji_id}.png"
+
+
+async def _fetch_image(url: str) -> Image.Image | None:
+    try:
+        session = await _get_http_session()
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.read()
+        return Image.open(io.BytesIO(data)).convert("RGBA")
+    except Exception as error:
+        print("Card image fetch failed:", url, error)
+        return None
+
+
+async def _get_cached_emoji_image(emoji_str: str, size: int) -> Image.Image | None:
+    cache_key = f"{emoji_str}:{size}"
+    if cache_key in _image_cache:
+        return _image_cache[cache_key]
+    img = await _fetch_image(_emoji_cdn_url(emoji_str))
+    if img is None:
+        return None
+    img = img.resize((size, size), Image.LANCZOS)
+    _image_cache[cache_key] = img
+    return img
+
+
+async def _fetch_avatar_image(user_id: int, size: int = 96) -> Image.Image | None:
+    try:
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+        avatar_bytes = await user.display_avatar.with_size(128).read()
+        img = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+        return img.resize((size, size), Image.LANCZOS)
+    except Exception as error:
+        print("Avatar fetch failed:", user_id, error)
+        return None
+
+
+async def _resolve_display_name(user_id: int) -> str:
+    try:
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+        return user.display_name
+    except Exception:
+        return f"User {user_id}"
+
+
+def _circle_mask(size: int) -> Image.Image:
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
+    return mask
+
+
+def _paste_circular(canvas: Image.Image, avatar: Image.Image, x: int, y: int, size: int):
+    avatar = avatar.resize((size, size), Image.LANCZOS)
+    canvas.paste(avatar, (x, y), _circle_mask(size))
+
+
+def _truncate(text: str, max_len: int) -> str:
+    return text if len(text) <= max_len else text[: max_len - 1].rstrip() + "…"
+
+
+def _render_sprint_card_sync(host_name: str, host_avatar: Image.Image | None,
+                              rows: list[dict], phoenix_watermark: Image.Image | None) -> bytes:
+    row_count = max(len(rows), 1)
+    height = CARD_PADDING * 2 + CARD_ROW_HEIGHT * (1 + row_count)
+    width = CARD_WIDTH
+
+    canvas = Image.new("RGB", (width, height))
+    draw = ImageDraw.Draw(canvas)
+    for y in range(height):
+        t = y / max(height - 1, 1)
+        r = int(CARD_TOP_COLOR[0] + (CARD_BOTTOM_COLOR[0] - CARD_TOP_COLOR[0]) * t)
+        g = int(CARD_TOP_COLOR[1] + (CARD_BOTTOM_COLOR[1] - CARD_TOP_COLOR[1]) * t)
+        b = int(CARD_TOP_COLOR[2] + (CARD_BOTTOM_COLOR[2] - CARD_TOP_COLOR[2]) * t)
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
+
+    canvas = canvas.convert("RGBA")
+    if phoenix_watermark is not None:
+        wm = phoenix_watermark.copy()
+        alpha = wm.getchannel("A").point(lambda a: int(a * 0.16))
+        wm.putalpha(alpha)
+        canvas.alpha_composite(wm, (width - wm.width - 12, height - wm.height - 12))
+
+    draw = ImageDraw.Draw(canvas)
+    font_bold = ImageFont.truetype(FONT_BOLD_PATH, 21)
+    font_regular = ImageFont.truetype(FONT_REGULAR_PATH, 16)
+    font_small = ImageFont.truetype(FONT_REGULAR_PATH, 14)
+
+    x_avatar = CARD_PADDING
+    text_x = x_avatar + CARD_AVATAR_SIZE + 16
+    y = CARD_PADDING
+
+    if host_avatar is not None:
+        _paste_circular(canvas, host_avatar, x_avatar, y, CARD_AVATAR_SIZE)
+    draw.text((text_x, y + 2), "HOSTING", font=font_small, fill=(255, 190, 140))
+    draw.text((text_x, y + 22), _truncate(host_name, 40), font=font_bold, fill=(255, 255, 255))
+    y += CARD_ROW_HEIGHT
+
+    draw.line([(CARD_PADDING, y - 6), (width - CARD_PADDING, y - 6)], fill=(255, 255, 255, 60), width=1)
+
+    if not rows:
+        draw.text((text_x, y + CARD_ROW_HEIGHT // 2 - 10), "No one yet — be the first!",
+                   font=font_regular, fill=(230, 230, 230))
+    else:
+        for row in rows:
+            if row.get("avatar") is not None:
+                _paste_circular(canvas, row["avatar"], x_avatar, y, CARD_AVATAR_SIZE)
+            draw.text((text_x, y + 2), _truncate(row["name"], 40), font=font_bold, fill=(255, 255, 255))
+            sub_x = text_x
+            if row.get("icon") is not None:
+                icon_small = row["icon"].resize((18, 18), Image.LANCZOS)
+                canvas.alpha_composite(icon_small, (text_x, y + 28))
+                sub_x = text_x + 24
+            draw.text((sub_x, y + 26), _truncate(row["subtitle"], 60), font=font_regular, fill=(225, 225, 225))
+            y += CARD_ROW_HEIGHT
+
+    buffer = io.BytesIO()
+    canvas.convert("RGB").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+async def build_sprint_card_file(sprint: dict, participants: list[dict]) -> discord.File:
+    host_id = int(sprint["host_id"])
+    host_name, host_avatar = await asyncio.gather(
+        _resolve_display_name(host_id), _fetch_avatar_image(host_id),
+    )
+
+    rows = []
+    for p in participants:
+        user_id = int(p["user_id"])
+        name, avatar = await asyncio.gather(_resolve_display_name(user_id), _fetch_avatar_image(user_id))
+        icon = await _get_cached_emoji_image(LOG_TYPE_ICONS.get(p.get("log_type"), EMOJI_OPENBOOK), 64)
+        start_str = _format_start_value(p)
+        parts = [part for part in (start_str, p.get("book_title") or "") if part]
+        rows.append({
+            "name": name,
+            "avatar": avatar,
+            "icon": icon,
+            "subtitle": " — ".join(parts) if parts else "Just joined",
+        })
+
+    phoenix_watermark = await _get_cached_emoji_image(EMOJI_PHOENIX, 200)
+
+    png_bytes = await run_blocking(_render_sprint_card_sync, host_name, host_avatar, rows, phoenix_watermark)
+    return discord.File(io.BytesIO(png_bytes), filename="sprint_card.png")
 
 
 # Six tracking types: two measurement methods each for ebook and audiobook, plus plain
@@ -774,14 +950,15 @@ def _relative_and_clock(dt: datetime) -> str:
     return f"<t:{ts}:R>\n<t:{ts}:t>"
 
 
-def build_sprint_announcement_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
-    names = "\n".join(_participant_line(p) for p in participants) or "No one yet — be the first!"
+def build_sprint_announcement_embed(sprint: dict) -> discord.Embed:
+    """Duration/Starts/Ends stay as native embed fields so Discord's <t:...:R> timestamps
+    keep auto-updating for free; host + participants are rendered into the attached
+    Pillow card instead (see build_sprint_card_file) so they can show avatars."""
     embed = discord.Embed(title=f"{EMOJI_FIRE} Sprint ignited!", color=SPRINT_COLOR)
     embed.add_field(name=f"{EMOJI_TIMER} Duration", value=f"{sprint['duration_minutes']} min", inline=True)
     embed.add_field(name=f"{EMOJI_HOURGLASS} Starts", value=_relative_and_clock(sprint["started_at"]), inline=True)
     embed.add_field(name=f"{EMOJI_HOURGLASS} Ends", value=_relative_and_clock(sprint["ends_at"]), inline=True)
-    embed.add_field(name=f"{EMOJI_BOOKSTACK} Participants ({len(participants)})", value=names, inline=False)
-    embed.add_field(name=f"{EMOJI_PHOENIXICON} Host", value=f"<@{sprint['host_id']}>", inline=False)
+    embed.set_image(url="attachment://sprint_card.png")
     _set_footer(embed)
     return embed
 
@@ -1002,8 +1179,9 @@ async def refresh_sprint_announcement(sprint_id: int):
     except discord.HTTPException:
         return
     participants = await run_blocking(db_get_participants, sprint_id)
+    card_file = await build_sprint_card_file(sprint, participants)
     try:
-        await message.edit(embed=build_sprint_announcement_embed(sprint, participants))
+        await message.edit(embed=build_sprint_announcement_embed(sprint), attachments=[card_file])
     except discord.HTTPException:
         pass
 
@@ -1363,11 +1541,13 @@ async def start_sprint(guild_id: int, channel: discord.abc.Messageable, host_id:
     content = f"<@&{role_id}>" if role_id else None
     allowed = discord.AllowedMentions(roles=True, users=False, everyone=False) if role_id else discord.AllowedMentions.none()
 
+    card_file = await build_sprint_card_file(sprint, participants)
     message = await channel.send(
         content=content,
-        embed=build_sprint_announcement_embed(sprint, participants),
+        embed=build_sprint_announcement_embed(sprint),
         view=SprintJoinView(),
         allowed_mentions=allowed,
+        file=card_file,
     )
     await run_blocking(db_set_sprint_message, sprint_id, message.id)
 
