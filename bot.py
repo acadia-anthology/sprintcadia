@@ -386,10 +386,12 @@ def db_get_sprint(sprint_id: int) -> dict | None:
         release_pg_connection(conn)
 
 
-def db_join_sprint(sprint_id: int, user_id: int, log_type: str, book_title: str = "") -> bool:
+def db_join_sprint(sprint_id: int, user_id: int, log_type: str, book_title: str = "") -> bool | None:
+    """Returns True (joined), False (already in this sprint), or None (a real DB error —
+    distinct from False so callers don't misreport an error as 'already joined')."""
     conn = get_pg_connection()
     if conn is None:
-        return False
+        return None
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -403,7 +405,7 @@ def db_join_sprint(sprint_id: int, user_id: int, log_type: str, book_title: str 
     except Exception as error:
         print("db_join_sprint error:", error)
         conn.rollback()
-        return False
+        return None
     finally:
         release_pg_connection(conn)
 
@@ -454,13 +456,13 @@ def db_find_loggable_sprint(channel_id: int, user_id: int) -> dict | None:
 
 
 def db_log_progress(sprint_id: int, user_id: int, guild_id: int, log_type: str,
-                     raw_amount: float, pages_equivalent: float | None, minutes_equivalent: float | None):
+                     raw_amount: float, pages_equivalent: float | None, minutes_equivalent: float | None) -> bool:
     """Logging is repeatable (like an 'update progress' action) — each call overwrites the
     participant's prior report and only nudges user_stats by the *difference*, so re-logging
     doesn't double-count pages/minutes already counted from an earlier report this sprint."""
     conn = get_pg_connection()
     if conn is None:
-        return
+        return False
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
@@ -491,9 +493,11 @@ def db_log_progress(sprint_id: int, user_id: int, guild_id: int, log_type: str,
                     total_minutes_read = user_stats.total_minutes_read + EXCLUDED.total_minutes_read
             """, (str(guild_id), str(user_id), sprint_delta, pages_delta, minutes_delta))
         conn.commit()
+        return True
     except Exception as error:
         print("db_log_progress error:", error)
         conn.rollback()
+        return False
     finally:
         release_pg_connection(conn)
 
@@ -669,12 +673,17 @@ def _participant_line(p: dict) -> str:
     return f"{icon} <@{p['user_id']}>{title}"
 
 
+def _relative_and_clock(dt: datetime) -> str:
+    ts = int(dt.timestamp())
+    return f"<t:{ts}:R>\n<t:{ts}:t>"
+
+
 def build_sprint_announcement_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
     names = "\n".join(_participant_line(p) for p in participants) or "No one yet — be the first!"
     embed = discord.Embed(title=f"{EMOJI_FIRE} Sprint ignited!", color=SPRINT_COLOR)
     embed.add_field(name=f"{EMOJI_TIMER} Duration", value=f"{sprint['duration_minutes']} min", inline=True)
-    embed.add_field(name=f"{EMOJI_HOURGLASS} Starts", value=f"<t:{int(sprint['started_at'].timestamp())}:R>", inline=True)
-    embed.add_field(name=f"{EMOJI_HOURGLASS} Ends", value=f"<t:{int(sprint['ends_at'].timestamp())}:R>", inline=True)
+    embed.add_field(name=f"{EMOJI_HOURGLASS} Starts", value=_relative_and_clock(sprint["started_at"]), inline=True)
+    embed.add_field(name=f"{EMOJI_HOURGLASS} Ends", value=_relative_and_clock(sprint["ends_at"]), inline=True)
     embed.add_field(name=f"{EMOJI_BOOKSTACK} Participants ({len(participants)})", value=names, inline=False)
     embed.add_field(name=f"{EMOJI_PHOENIXICON} Host", value=f"<@{sprint['host_id']}>", inline=False)
     _set_footer(embed)
@@ -683,11 +692,8 @@ def build_sprint_announcement_embed(sprint: dict, participants: list[dict]) -> d
 
 def build_sprint_status_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
     lines = [_participant_line(p) for p in participants] or ["No one has joined yet."]
-    embed = discord.Embed(
-        title=f"{EMOJI_TIMER} Sprint status",
-        description=f"Ends <t:{int(sprint['ends_at'].timestamp())}:R>",
-        color=SPRINT_COLOR,
-    )
+    embed = discord.Embed(title=f"{EMOJI_TIMER} Sprint status", color=SPRINT_COLOR)
+    embed.add_field(name=f"{EMOJI_HOURGLASS} Ends", value=_relative_and_clock(sprint["ends_at"]), inline=True)
     embed.add_field(name=f"{EMOJI_BOOKSTACK} Participants ({len(participants)})", value="\n".join(lines), inline=False)
     _set_footer(embed)
     return embed
@@ -705,36 +711,46 @@ def build_sprint_end_embed(sprint: dict, participants: list[dict]) -> discord.Em
     return embed
 
 
-def _format_result_line(p: dict) -> str:
+MEDALS = ["🥇", "🥈", "🥉"]
+
+
+def _format_result_line(p: dict, rank_prefix: str = "") -> str:
     uid = p["user_id"]
     title = f" *({p['book_title']})*" if p.get("book_title") else ""
     if not p["reported"]:
-        return f"<@{uid}>{title} — no report yet"
+        return f"{rank_prefix}<@{uid}>{title} — no report yet"
 
     log_type = p["log_type"]
     raw = p["raw_amount"]
     if log_type == "pages":
-        return f"<@{uid}>{title} — **{float(raw):g} pages**"
+        return f"{rank_prefix}<@{uid}>{title} — **{float(raw):g} pages**"
     if log_type == "percentage":
-        return f"<@{uid}>{title} — **{float(raw):g}%** → **{float(p['pages_equivalent']):g} pages**"
+        return f"{rank_prefix}<@{uid}>{title} — **{float(raw):g}%** → **{float(p['pages_equivalent']):g} pages**"
     if log_type == "audio":
-        return f"<@{uid}>{title} — **{float(raw):g}%** listened → **{float(p['minutes_equivalent']):g} min**"
+        return f"{rank_prefix}<@{uid}>{title} — **{float(raw):g}%** listened → **{float(p['minutes_equivalent']):g} min**"
     if log_type == "fanfic":
-        return f"<@{uid}>{title} — **{float(raw):g} words** → **{float(p['pages_equivalent']):g} pages**"
-    return f"<@{uid}>{title} — reported"
+        return f"{rank_prefix}<@{uid}>{title} — **{float(raw):g} words** → **{float(p['pages_equivalent']):g} pages**"
+    return f"{rank_prefix}<@{uid}>{title} — reported"
 
 
 def build_sprint_results_embed(participants: list[dict]) -> discord.Embed:
+    # db_get_participants already orders reported-first, highest pages_equivalent first —
+    # ranking here is purely cosmetic (medal prefixes), not a re-sort.
     reported = [p for p in participants if p["reported"]]
     unreported = [p for p in participants if not p["reported"]]
 
     total_pages = sum(float(p["pages_equivalent"]) for p in reported if p["pages_equivalent"] is not None)
     total_minutes = sum(float(p["minutes_equivalent"]) for p in reported if p["minutes_equivalent"] is not None)
 
+    ranked_lines = [
+        _format_result_line(p, MEDALS[i] + " " if i < len(MEDALS) else f"{i + 1}. ")
+        for i, p in enumerate(reported)
+    ]
+
     embed = discord.Embed(title=f"{EMOJI_PHOENIXICON} Sprint results", color=RESULT_COLOR)
     embed.add_field(
         name="Reported",
-        value="\n".join(_format_result_line(p) for p in reported) or "No one has reported yet.",
+        value="\n".join(ranked_lines) or "No one has reported yet.",
         inline=False,
     )
     if unreported:
@@ -768,10 +784,9 @@ def build_leaderboard_embed(guild_name: str, metric: str, rows: list[dict]) -> d
     if not rows:
         embed.description = "No sprint data yet."
         return embed
-    medals = ["🥇", "🥈", "🥉"]
     lines = []
     for i, row in enumerate(rows):
-        prefix = medals[i] if i < len(medals) else f"{i + 1}."
+        prefix = MEDALS[i] if i < len(MEDALS) else f"{i + 1}."
         value = row["total_pages"] if metric == "pages" else row["total_sprints"]
         unit = "pages" if metric == "pages" else "sprints"
         lines.append(f"{prefix} <@{row['user_id']}> — **{float(value):g}** {unit}")
@@ -797,8 +812,14 @@ async def apply_log(interaction: discord.Interaction, log_type: str, raw_amount:
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
-    await run_blocking(db_log_progress, sprint["id"], interaction.user.id, interaction.guild_id,
-                        log_type, raw_amount, pages_equivalent, minutes_equivalent)
+    ok = await run_blocking(db_log_progress, sprint["id"], interaction.user.id, interaction.guild_id,
+                             log_type, raw_amount, pages_equivalent, minutes_equivalent)
+    if not ok:
+        await interaction.response.send_message(
+            embed=discord.Embed(description="⚠️ Something went wrong saving that — please try again.", color=ALERT_COLOR),
+            ephemeral=True,
+        )
+        return
     await interaction.response.send_message(confirm_text, ephemeral=True)
 
 
@@ -811,6 +832,12 @@ async def handle_join(interaction: discord.Interaction, log_type: str, book_titl
         )
         return
     joined = await run_blocking(db_join_sprint, sprint["id"], interaction.user.id, log_type, book_title.strip())
+    if joined is None:
+        await interaction.response.send_message(
+            embed=discord.Embed(description="⚠️ Something went wrong saving that — please try again.", color=ALERT_COLOR),
+            ephemeral=True,
+        )
+        return
     if joined:
         label = LOG_TYPE_LABELS.get(log_type, log_type)
         extra = f" — reading *{book_title.strip()}*" if book_title.strip() else ""
