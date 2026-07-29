@@ -22,6 +22,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 FANFIC_WORDS_PER_PAGE = 250
 
 SPRINT_ROLE_SETTING_KEY = "Sprint Ping Role ID"
+RESULTS_GRACE_SECONDS = 300  # 5 minutes after a sprint ends before results auto-post
 
 # ===== CUSTOM APPLICATION EMOJIS (uploaded to the bot itself in the Dev Portal) =====
 EMOJI_TIMER = "<:timer:1531488929201524958>"
@@ -48,15 +49,26 @@ def _set_footer(embed: discord.Embed):
     embed.set_footer(text="Sprintcadia", icon_url=PHOENIX_FOOTER_ICON_URL)
 
 
-LOG_TYPE_ICONS = {"pages": EMOJI_PAGE, "percentage": EMOJI_PERCENTAGE, "audio": EMOJI_AUDIOBOOK, "fanfic": EMOJI_QUILL}
-LOG_TYPE_LABELS = {"pages": "Pages", "percentage": "Ebook %", "audio": "Audiobook", "fanfic": "Fanfic"}
-
-JOIN_LOG_TYPE_CHOICES = [
-    app_commands.Choice(name="Pages", value="pages"),
-    app_commands.Choice(name="Ebook %", value="percentage"),
-    app_commands.Choice(name="Audiobook", value="audio"),
-    app_commands.Choice(name="Fanfic", value="fanfic"),
-]
+# Six tracking types: two measurement methods each for ebook and audiobook, plus plain
+# pages (physical books) and fanfic (words). "Percent" types need total_reference (book's
+# total pages / audiobook's total length) to convert a delta% into pages/minutes; the
+# others (pages, ebook_pages, audio_time, fanfic) are direct deltas against start_value.
+LOG_TYPE_LABELS = {
+    "pages": "Pages",
+    "ebook_pages": "Ebook (Pages)",
+    "ebook_percent": "Ebook (%)",
+    "audio_percent": "Audiobook (%)",
+    "audio_time": "Audiobook (Time)",
+    "fanfic": "Fanfic",
+}
+LOG_TYPE_ICONS = {
+    "pages": EMOJI_PAGE,
+    "ebook_pages": EMOJI_EBOOK,
+    "ebook_percent": EMOJI_PERCENTAGE,
+    "audio_percent": EMOJI_PERCENTAGE,
+    "audio_time": EMOJI_AUDIOBOOK,
+    "fanfic": EMOJI_QUILL,
+}
 
 WEEKDAY_CHOICES = [
     app_commands.Choice(name="Monday", value=0),
@@ -86,6 +98,16 @@ def _parse_float(text: str) -> float | None:
         return float(str(text).strip())
     except (TypeError, ValueError):
         return None
+
+
+def _format_minutes_label(total_minutes: float) -> str:
+    total = int(round(total_minutes))
+    hours, minutes = divmod(total, 60)
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
 
 
 # ===== POSTGRES CONNECTION POOL =====
@@ -161,7 +183,9 @@ def init_postgres_schema():
                     status                   TEXT NOT NULL DEFAULT 'active',
                     started_at               TIMESTAMPTZ DEFAULT now(),
                     ends_at                  TIMESTAMPTZ NOT NULL,
-                    announcement_message_id  TEXT DEFAULT ''
+                    announcement_message_id  TEXT DEFAULT '',
+                    results_grace_ends_at    TIMESTAMPTZ,
+                    results_posted           BOOLEAN NOT NULL DEFAULT FALSE
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sprints_channel_status ON sprints (channel_id, status)")
@@ -172,6 +196,8 @@ def init_postgres_schema():
                     joined_at          TIMESTAMPTZ DEFAULT now(),
                     log_type           TEXT DEFAULT '',
                     book_title         TEXT DEFAULT '',
+                    start_value        NUMERIC DEFAULT 0,
+                    total_reference    NUMERIC,
                     raw_amount         NUMERIC,
                     pages_equivalent   NUMERIC,
                     minutes_equivalent NUMERIC,
@@ -386,7 +412,8 @@ def db_get_sprint(sprint_id: int) -> dict | None:
         release_pg_connection(conn)
 
 
-def db_join_sprint(sprint_id: int, user_id: int, log_type: str, book_title: str = "") -> bool | None:
+def db_join_sprint(sprint_id: int, user_id: int, log_type: str, book_title: str,
+                    start_value: float, total_reference: float | None) -> bool | None:
     """Returns True (joined), False (already in this sprint), or None (a real DB error —
     distinct from False so callers don't misreport an error as 'already joined')."""
     conn = get_pg_connection()
@@ -395,10 +422,10 @@ def db_join_sprint(sprint_id: int, user_id: int, log_type: str, book_title: str 
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO sprint_participants (sprint_id, user_id, log_type, book_title)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO sprint_participants (sprint_id, user_id, log_type, book_title, start_value, total_reference)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT DO NOTHING
-            """, (sprint_id, str(user_id), log_type, book_title))
+            """, (sprint_id, str(user_id), log_type, book_title, start_value, total_reference))
             joined = cur.rowcount > 0
         conn.commit()
         return joined
@@ -417,7 +444,8 @@ def db_get_participants(sprint_id: int) -> list[dict]:
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT user_id, log_type, book_title, raw_amount, pages_equivalent, minutes_equivalent, reported
+                SELECT user_id, log_type, book_title, start_value, total_reference,
+                       raw_amount, pages_equivalent, minutes_equivalent, reported
                 FROM sprint_participants
                 WHERE sprint_id = %s
                 ORDER BY reported DESC, COALESCE(pages_equivalent, 0) DESC, joined_at ASC
@@ -433,14 +461,16 @@ def db_get_participants(sprint_id: int) -> list[dict]:
 def db_find_loggable_sprint(channel_id: int, user_id: int) -> dict | None:
     """The sprint in this channel the user should log progress against: the active one
     if they're in it, otherwise the most recent one they joined. Includes their own
-    log_type/book_title from that sprint so the log button knows which modal to open."""
+    log_type/start_value/total_reference from that sprint so the log button knows which
+    modal to open and what to compute the delta against."""
     conn = get_pg_connection()
     if conn is None:
         return None
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT s.*, p.log_type AS participant_log_type, p.book_title AS participant_book_title
+                SELECT s.*, p.log_type AS participant_log_type, p.book_title AS participant_book_title,
+                       p.start_value AS participant_start_value, p.total_reference AS participant_total_reference
                 FROM sprints s
                 JOIN sprint_participants p ON p.sprint_id = s.id
                 WHERE s.channel_id = %s AND p.user_id = %s
@@ -513,6 +543,51 @@ def db_end_sprint(sprint_id: int, status: str = "ended"):
     except Exception as error:
         print("db_end_sprint error:", error)
         conn.rollback()
+    finally:
+        release_pg_connection(conn)
+
+
+def db_start_results_grace(sprint_id: int, grace_ends_at: datetime):
+    conn = get_pg_connection()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE sprints SET results_grace_ends_at = %s WHERE id = %s", (grace_ends_at, sprint_id))
+        conn.commit()
+    except Exception as error:
+        print("db_start_results_grace error:", error)
+        conn.rollback()
+    finally:
+        release_pg_connection(conn)
+
+
+def db_mark_results_posted(sprint_id: int):
+    conn = get_pg_connection()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE sprints SET results_posted = TRUE WHERE id = %s", (sprint_id,))
+        conn.commit()
+    except Exception as error:
+        print("db_mark_results_posted error:", error)
+        conn.rollback()
+    finally:
+        release_pg_connection(conn)
+
+
+def db_get_sprints_awaiting_results() -> list[dict]:
+    conn = get_pg_connection()
+    if conn is None:
+        return []
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM sprints WHERE status = 'ended' AND results_posted = FALSE")
+            return list(cur.fetchall())
+    except Exception as error:
+        print("db_get_sprints_awaiting_results error:", error)
+        return []
     finally:
         release_pg_connection(conn)
 
@@ -667,10 +742,31 @@ def db_mark_scheduled_triggered(schedule_id: int, today_str: str):
 
 
 # ===== EMBED BUILDERS =====
+def _format_start_value(p: dict) -> str:
+    log_type = p.get("log_type")
+    start = p.get("start_value")
+    total = p.get("total_reference")
+    if start is None:
+        return ""
+    if log_type in ("pages", "ebook_pages"):
+        return f"page {int(start)}"
+    if log_type == "ebook_percent":
+        return f"{float(start):g}%" + (f" (of {int(total)}pg)" if total else "")
+    if log_type == "audio_percent":
+        return f"{float(start):g}% listened" + (f" (of {_format_minutes_label(total)})" if total else "")
+    if log_type == "audio_time":
+        return f"{_format_minutes_label(start)} in"
+    if log_type == "fanfic":
+        return f"{int(start):,} words"
+    return ""
+
+
 def _participant_line(p: dict) -> str:
     icon = LOG_TYPE_ICONS.get(p.get("log_type"), EMOJI_OPENBOOK)
+    start_str = _format_start_value(p)
+    start_part = f" — {start_str}" if start_str else ""
     title = f" — reading *{p['book_title']}*" if p.get("book_title") else ""
-    return f"{icon} <@{p['user_id']}>{title}"
+    return f"{icon} <@{p['user_id']}>{start_part}{title}"
 
 
 def _relative_and_clock(dt: datetime) -> str:
@@ -701,9 +797,13 @@ def build_sprint_status_embed(sprint: dict, participants: list[dict]) -> discord
 
 def build_sprint_end_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
     names = "\n".join(_participant_line(p) for p in participants) or "No one joined this one."
+    grace_minutes = RESULTS_GRACE_SECONDS // 60
     embed = discord.Embed(
         title=f"{EMOJI_PHOENIX} Sprint complete — rise & report!",
-        description=f"The {sprint['duration_minutes']}-minute sprint is over. Tap **Log Sprint** below.",
+        description=(
+            f"The {sprint['duration_minutes']}-minute sprint is over. Tap **Log Sprint** below.\n"
+            f"Results post automatically in {grace_minutes} minutes — sooner if everyone's logged in."
+        ),
         color=RESULT_COLOR,
     )
     embed.add_field(name=f"{EMOJI_BOOKSTACK} Participants", value=names, inline=False)
@@ -718,18 +818,22 @@ def _format_result_line(p: dict, rank_prefix: str = "") -> str:
     uid = p["user_id"]
     title = f" *({p['book_title']})*" if p.get("book_title") else ""
     if not p["reported"]:
-        return f"{rank_prefix}<@{uid}>{title} — no report yet"
+        start_str = _format_start_value(p)
+        started = f" (started at {start_str})" if start_str else ""
+        return f"{rank_prefix}<@{uid}>{title}{started} — no report yet"
 
     log_type = p["log_type"]
     raw = p["raw_amount"]
-    if log_type == "pages":
-        return f"{rank_prefix}<@{uid}>{title} — **{float(raw):g} pages**"
-    if log_type == "percentage":
-        return f"{rank_prefix}<@{uid}>{title} — **{float(raw):g}%** → **{float(p['pages_equivalent']):g} pages**"
-    if log_type == "audio":
-        return f"{rank_prefix}<@{uid}>{title} — **{float(raw):g}%** listened → **{float(p['minutes_equivalent']):g} min**"
+    if log_type in ("pages", "ebook_pages"):
+        return f"{rank_prefix}<@{uid}>{title} — page **{int(raw)}** (**{float(p['pages_equivalent']):+g} pages**)"
+    if log_type == "ebook_percent":
+        return f"{rank_prefix}<@{uid}>{title} — **{float(raw):g}%** (**{float(p['pages_equivalent']):+g} pages**)"
+    if log_type == "audio_percent":
+        return f"{rank_prefix}<@{uid}>{title} — **{float(raw):g}%** listened (**{float(p['minutes_equivalent']):+g} min**)"
+    if log_type == "audio_time":
+        return f"{rank_prefix}<@{uid}>{title} — **{_format_minutes_label(raw)} in** (**{float(p['minutes_equivalent']):+g} min**)"
     if log_type == "fanfic":
-        return f"{rank_prefix}<@{uid}>{title} — **{float(raw):g} words** → **{float(p['pages_equivalent']):g} pages**"
+        return f"{rank_prefix}<@{uid}>{title} — **{int(raw):,} words** (**{float(p['pages_equivalent']):+g} pages**)"
     return f"{rank_prefix}<@{uid}>{title} — reported"
 
 
@@ -800,6 +904,7 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 active_sprint_tasks: dict[int, asyncio.Task] = {}
+grace_tasks: dict[int, asyncio.Task] = {}
 
 
 async def apply_log(interaction: discord.Interaction, log_type: str, raw_amount: float,
@@ -820,10 +925,21 @@ async def apply_log(interaction: discord.Interaction, log_type: str, raw_amount:
             ephemeral=True,
         )
         return
-    await interaction.response.send_message(confirm_text, ephemeral=True)
+    await interaction.response.send_message(f"{interaction.user.mention} {confirm_text}")
+
+    # If the sprint's already in its post-end grace window and everyone's now reported,
+    # post the results board right away instead of waiting out the rest of the window.
+    if sprint["status"] == "ended" and not sprint.get("results_posted"):
+        participants = await run_blocking(db_get_participants, sprint["id"])
+        if participants and all(p["reported"] for p in participants):
+            task = grace_tasks.pop(sprint["id"], None)
+            if task is not None:
+                task.cancel()
+            bot.loop.create_task(post_sprint_results(sprint["id"]))
 
 
-async def handle_join(interaction: discord.Interaction, log_type: str, book_title: str = ""):
+async def handle_join(interaction: discord.Interaction, log_type: str, book_title: str,
+                       start_value: float, total_reference: float | None):
     sprint = await run_blocking(db_get_active_sprint, interaction.channel_id)
     if sprint is None:
         await interaction.response.send_message(
@@ -831,7 +947,8 @@ async def handle_join(interaction: discord.Interaction, log_type: str, book_titl
             ephemeral=True,
         )
         return
-    joined = await run_blocking(db_join_sprint, sprint["id"], interaction.user.id, log_type, book_title.strip())
+    joined = await run_blocking(db_join_sprint, sprint["id"], interaction.user.id, log_type,
+                                 book_title.strip(), start_value, total_reference)
     if joined is None:
         await interaction.response.send_message(
             embed=discord.Embed(description="⚠️ Something went wrong saving that — please try again.", color=ALERT_COLOR),
@@ -839,9 +956,9 @@ async def handle_join(interaction: discord.Interaction, log_type: str, book_titl
         )
         return
     if joined:
-        label = LOG_TYPE_LABELS.get(log_type, log_type)
+        start_str = _format_start_value({"log_type": log_type, "start_value": start_value, "total_reference": total_reference})
         extra = f" — reading *{book_title.strip()}*" if book_title.strip() else ""
-        await interaction.response.send_message(f"✅ {interaction.user.mention} joined, tracking **{label}**{extra}!")
+        await interaction.response.send_message(f"{EMOJI_PIN} {interaction.user.mention} joined at **{start_str}**{extra}!")
         await refresh_sprint_announcement(sprint["id"])
     else:
         await interaction.response.send_message("You're already in this sprint.", ephemeral=True)
@@ -860,14 +977,17 @@ async def open_log_modal_for_user(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
-    modal_cls = LOG_TYPE_MODALS.get(sprint["participant_log_type"])
-    if modal_cls is None:
+    log_type = sprint["participant_log_type"]
+    factory = LOG_MODAL_FACTORIES.get(log_type)
+    if factory is None:
         await interaction.response.send_message(
             embed=discord.Embed(description="Couldn't tell how you're tracking this sprint — try joining again.", color=ALERT_COLOR),
             ephemeral=True,
         )
         return
-    await interaction.response.send_modal(modal_cls())
+    start_value = float(sprint["participant_start_value"]) if sprint.get("participant_start_value") is not None else 0.0
+    total_reference = float(sprint["participant_total_reference"]) if sprint.get("participant_total_reference") is not None else None
+    await interaction.response.send_modal(factory(start_value, total_reference))
 
 
 async def refresh_sprint_announcement(sprint_id: int):
@@ -888,126 +1008,276 @@ async def refresh_sprint_announcement(sprint_id: int):
         pass
 
 
-# ===== LOG MODALS (one per tracking type, opened directly — no type picker at log time) =====
-class LogPagesModal(discord.ui.Modal, title="Log Pages"):
-    pages_input = discord.ui.TextInput(label="Pages read this sprint", placeholder="e.g. 42", max_length=6)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        value = _parse_int(self.pages_input.value)
-        if value is None or value <= 0:
-            await interaction.response.send_message(
-                embed=discord.Embed(description="Enter a whole number of pages greater than 0.", color=ALERT_COLOR),
-                ephemeral=True,
-            )
-            return
-        await apply_log(interaction, "pages", float(value), float(value), None, f"{EMOJI_PAGE} Logged **{value} pages**.")
-
-
-class LogPercentageModal(discord.ui.Modal, title="Log Ebook Progress"):
-    percent_input = discord.ui.TextInput(label="Percent of book read this sprint", placeholder="e.g. 12.5")
-    total_pages_input = discord.ui.TextInput(label="Book's total page count", placeholder="e.g. 320")
-
-    async def on_submit(self, interaction: discord.Interaction):
-        percent = _parse_float(self.percent_input.value)
-        total_pages = _parse_int(self.total_pages_input.value)
-        if percent is None or not (0 < percent <= 100) or total_pages is None or total_pages <= 0:
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    description="Enter a percent between 0-100 and a total page count greater than 0.",
-                    color=ALERT_COLOR,
-                ),
-                ephemeral=True,
-            )
-            return
-        pages = round(percent / 100 * total_pages, 1)
-        await apply_log(
-            interaction, "percentage", percent, pages, None,
-            f"{EMOJI_EBOOK} Logged **{percent:g}%** of a {total_pages}-page book → **{pages:g} pages**.",
-        )
+async def post_sprint_results(sprint_id: int):
+    sprint = await run_blocking(db_get_sprint, sprint_id)
+    if sprint is None or sprint.get("results_posted"):
+        return
+    await run_blocking(db_mark_results_posted, sprint_id)
+    grace_tasks.pop(sprint_id, None)
+    channel = bot.get_channel(int(sprint["channel_id"]))
+    if channel is None:
+        return
+    participants = await run_blocking(db_get_participants, sprint_id)
+    try:
+        await channel.send(embed=build_sprint_results_embed(participants))
+    except discord.HTTPException as error:
+        print("Failed to post sprint results:", error)
 
 
-class LogAudioModal(discord.ui.Modal, title="Log Audiobook Progress"):
-    percent_input = discord.ui.TextInput(label="Percent listened this sprint", placeholder="e.g. 8")
-    hours_input = discord.ui.TextInput(label="Audiobook total length — hours", placeholder="e.g. 8", required=False, default="0")
-    minutes_input = discord.ui.TextInput(label="Audiobook total length — minutes", placeholder="e.g. 30", required=False, default="0")
-
-    async def on_submit(self, interaction: discord.Interaction):
-        percent = _parse_float(self.percent_input.value)
-        hours = _parse_int(self.hours_input.value) or 0
-        minutes = _parse_int(self.minutes_input.value) or 0
-        total_minutes = hours * 60 + minutes
-        if percent is None or not (0 < percent <= 100) or total_minutes <= 0:
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    description="Enter a percent between 0-100 and the audiobook's total length.",
-                    color=ALERT_COLOR,
-                ),
-                ephemeral=True,
-            )
-            return
-        listened = round(percent / 100 * total_minutes, 1)
-        await apply_log(
-            interaction, "audio", percent, None, listened,
-            f"{EMOJI_AUDIOBOOK} Logged **{percent:g}%** of a {hours}h{minutes}m audiobook → **{listened:g} min**.",
-        )
+async def run_results_grace_period(sprint_id: int, seconds: float):
+    if seconds > 0:
+        await asyncio.sleep(seconds)
+    await post_sprint_results(sprint_id)
 
 
-class LogFanficModal(discord.ui.Modal, title="Log Fanfic Words"):
-    words_input = discord.ui.TextInput(label="Words read this sprint", placeholder="e.g. 1500")
-
-    async def on_submit(self, interaction: discord.Interaction):
-        words = _parse_int(self.words_input.value)
-        if words is None or words <= 0:
-            await interaction.response.send_message(
-                embed=discord.Embed(description="Enter a whole number of words greater than 0.", color=ALERT_COLOR),
-                ephemeral=True,
-            )
-            return
-        pages = round(words / FANFIC_WORDS_PER_PAGE, 1)
-        await apply_log(
-            interaction, "fanfic", float(words), pages, None,
-            f"{EMOJI_QUILL} Logged **{words:,} words** → **{pages:g} pages**.",
-        )
-
-
-LOG_TYPE_MODALS = {
-    "pages": LogPagesModal,
-    "percentage": LogPercentageModal,
-    "audio": LogAudioModal,
-    "fanfic": LogFanficModal,
-}
-
-
-# ===== JOIN FLOW (pick tracking type, then optional book/fic title) =====
-class JoinDetailsModal(discord.ui.Modal, title="Join Sprint"):
+# ===== JOIN MODALS (one per tracking type — captures a starting point + optional title) =====
+class JoinPageBasedModal(discord.ui.Modal):
     book_title_input = discord.ui.TextInput(label="What are you reading? (optional)", required=False, max_length=100)
+    starting_page_input = discord.ui.TextInput(label="What page are you starting on?", placeholder="e.g. 74", default="0")
 
     def __init__(self, log_type: str):
-        super().__init__()
+        super().__init__(title=f"Join Sprint — {LOG_TYPE_LABELS[log_type]}")
         self.log_type = log_type
 
     async def on_submit(self, interaction: discord.Interaction):
-        await handle_join(interaction, self.log_type, self.book_title_input.value)
+        start = _parse_int(self.starting_page_input.value)
+        if start is None or start < 0:
+            await interaction.response.send_message(
+                embed=discord.Embed(description="Enter a starting page number (0 or higher).", color=ALERT_COLOR),
+                ephemeral=True,
+            )
+            return
+        await handle_join(interaction, self.log_type, self.book_title_input.value, float(start), None)
+
+
+class JoinEbookPercentModal(discord.ui.Modal, title="Join Sprint — Ebook (%)"):
+    book_title_input = discord.ui.TextInput(label="What are you reading? (optional)", required=False, max_length=100)
+    starting_percent_input = discord.ui.TextInput(label="What percent are you starting at?", placeholder="e.g. 30", default="0")
+    total_pages_input = discord.ui.TextInput(label="Book's total page count", placeholder="e.g. 320")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        start = _parse_float(self.starting_percent_input.value)
+        total_pages = _parse_int(self.total_pages_input.value)
+        if start is None or not (0 <= start <= 100) or total_pages is None or total_pages <= 0:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="Enter a starting percent (0-100) and a total page count greater than 0.",
+                    color=ALERT_COLOR,
+                ),
+                ephemeral=True,
+            )
+            return
+        await handle_join(interaction, "ebook_percent", self.book_title_input.value, start, float(total_pages))
+
+
+class JoinAudioPercentModal(discord.ui.Modal, title="Join Sprint — Audiobook (%)"):
+    book_title_input = discord.ui.TextInput(label="What are you listening to? (optional)", required=False, max_length=100)
+    starting_percent_input = discord.ui.TextInput(label="Percent listened so far", placeholder="e.g. 10", default="0")
+    total_hours_input = discord.ui.TextInput(label="Audiobook total length — hours", required=False, default="0")
+    total_minutes_input = discord.ui.TextInput(label="Audiobook total length — minutes", required=False, default="0")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        start = _parse_float(self.starting_percent_input.value)
+        hours = _parse_int(self.total_hours_input.value) or 0
+        minutes = _parse_int(self.total_minutes_input.value) or 0
+        total = hours * 60 + minutes
+        if start is None or not (0 <= start <= 100) or total <= 0:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="Enter a starting percent (0-100) and the audiobook's total length.",
+                    color=ALERT_COLOR,
+                ),
+                ephemeral=True,
+            )
+            return
+        await handle_join(interaction, "audio_percent", self.book_title_input.value, start, float(total))
+
+
+class JoinAudioTimeModal(discord.ui.Modal, title="Join Sprint — Audiobook (Time)"):
+    book_title_input = discord.ui.TextInput(label="What are you listening to? (optional)", required=False, max_length=100)
+    starting_hours_input = discord.ui.TextInput(label="Starting point — hours in", required=False, default="0")
+    starting_minutes_input = discord.ui.TextInput(label="Starting point — minutes in", required=False, default="0")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        hours = _parse_int(self.starting_hours_input.value) or 0
+        minutes = _parse_int(self.starting_minutes_input.value) or 0
+        if hours < 0 or minutes < 0:
+            await interaction.response.send_message(
+                embed=discord.Embed(description="Enter a starting time of 0 or higher.", color=ALERT_COLOR),
+                ephemeral=True,
+            )
+            return
+        await handle_join(interaction, "audio_time", self.book_title_input.value, float(hours * 60 + minutes), None)
+
+
+class JoinFanficModal(discord.ui.Modal, title="Join Sprint — Fanfic"):
+    fic_title_input = discord.ui.TextInput(label="Fic title (optional)", required=False, max_length=100)
+    starting_words_input = discord.ui.TextInput(label="What's your starting word count?", placeholder="e.g. 0", default="0")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        start = _parse_int(self.starting_words_input.value)
+        if start is None or start < 0:
+            await interaction.response.send_message(
+                embed=discord.Embed(description="Enter a starting word count of 0 or higher.", color=ALERT_COLOR),
+                ephemeral=True,
+            )
+            return
+        await handle_join(interaction, "fanfic", self.fic_title_input.value, float(start), None)
+
+
+JOIN_MODAL_FACTORIES = {
+    "pages": lambda: JoinPageBasedModal("pages"),
+    "ebook_pages": lambda: JoinPageBasedModal("ebook_pages"),
+    "ebook_percent": lambda: JoinEbookPercentModal(),
+    "audio_percent": lambda: JoinAudioPercentModal(),
+    "audio_time": lambda: JoinAudioTimeModal(),
+    "fanfic": lambda: JoinFanficModal(),
+}
 
 
 class JoinTypeSelect(discord.ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(label="Pages", value="pages", emoji=EMOJI_PAGE, description="Track by page number"),
-            discord.SelectOption(label="Ebook %", value="percentage", emoji=EMOJI_EBOOK, description="Track by percent complete (e.g. Kindle)"),
-            discord.SelectOption(label="Audiobook", value="audio", emoji=EMOJI_AUDIOBOOK, description="Track by percent listened"),
-            discord.SelectOption(label="Fanfic", value="fanfic", emoji=EMOJI_QUILL, description="Track by word count"),
+            discord.SelectOption(label="Pages", value="pages", emoji=EMOJI_PAGE,
+                                  description="Physical/print book — track by page number"),
+            discord.SelectOption(label="Ebook (Pages)", value="ebook_pages", emoji=EMOJI_EBOOK,
+                                  description="E-reader that shows a page number"),
+            discord.SelectOption(label="Ebook (%)", value="ebook_percent", emoji=EMOJI_PERCENTAGE,
+                                  description="E-reader that shows percent complete (e.g. Kindle)"),
+            discord.SelectOption(label="Audiobook (%)", value="audio_percent", emoji=EMOJI_PERCENTAGE,
+                                  description="Track by percent listened"),
+            discord.SelectOption(label="Audiobook (Time)", value="audio_time", emoji=EMOJI_AUDIOBOOK,
+                                  description="Track by elapsed listening time"),
+            discord.SelectOption(label="Fanfic", value="fanfic", emoji=EMOJI_QUILL,
+                                  description="Track by word count (250 words ≈ 1 page)"),
         ]
         super().__init__(placeholder="How are you tracking this sprint?", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(JoinDetailsModal(self.values[0]))
+        modal = JOIN_MODAL_FACTORIES[self.values[0]]()
+        await interaction.response.send_modal(modal)
 
 
 class JoinTypeSelectView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
         self.add_item(JoinTypeSelect())
+
+
+# ===== LOG MODALS (current value only — deltas computed against the stored start_value) =====
+class LogPageBasedModal(discord.ui.Modal):
+    current_page_input = discord.ui.TextInput(label="What page are you on now?", placeholder="e.g. 146")
+
+    def __init__(self, log_type: str, start_value: float):
+        super().__init__(title=f"Log {LOG_TYPE_LABELS[log_type]}")
+        self.log_type = log_type
+        self.start_value = start_value
+
+    async def on_submit(self, interaction: discord.Interaction):
+        current = _parse_int(self.current_page_input.value)
+        if current is None or current < 0:
+            await interaction.response.send_message(
+                embed=discord.Embed(description="Enter a whole page number.", color=ALERT_COLOR), ephemeral=True,
+            )
+            return
+        delta = current - self.start_value
+        icon = LOG_TYPE_ICONS[self.log_type]
+        await apply_log(interaction, self.log_type, float(current), float(delta), None,
+                         f"{icon} logged **page {current}** (**{delta:+g} pages** this sprint).")
+
+
+class LogEbookPercentModal(discord.ui.Modal, title="Log Ebook Progress"):
+    current_percent_input = discord.ui.TextInput(label="What percent are you at now?", placeholder="e.g. 62")
+
+    def __init__(self, start_value: float, total_reference: float | None):
+        super().__init__()
+        self.start_value = start_value
+        self.total_reference = total_reference or 0
+
+    async def on_submit(self, interaction: discord.Interaction):
+        current = _parse_float(self.current_percent_input.value)
+        if current is None or not (0 <= current <= 100):
+            await interaction.response.send_message(
+                embed=discord.Embed(description="Enter a percent between 0-100.", color=ALERT_COLOR), ephemeral=True,
+            )
+            return
+        delta_percent = current - self.start_value
+        pages = round(delta_percent / 100 * self.total_reference, 1)
+        await apply_log(interaction, "ebook_percent", current, pages, None,
+                         f"{EMOJI_PERCENTAGE} logged **{current:g}%** (**{pages:+g} pages** this sprint).")
+
+
+class LogAudioPercentModal(discord.ui.Modal, title="Log Audiobook Progress (%)"):
+    current_percent_input = discord.ui.TextInput(label="What percent have you listened to now?", placeholder="e.g. 45")
+
+    def __init__(self, start_value: float, total_reference: float | None):
+        super().__init__()
+        self.start_value = start_value
+        self.total_reference = total_reference or 0
+
+    async def on_submit(self, interaction: discord.Interaction):
+        current = _parse_float(self.current_percent_input.value)
+        if current is None or not (0 <= current <= 100):
+            await interaction.response.send_message(
+                embed=discord.Embed(description="Enter a percent between 0-100.", color=ALERT_COLOR), ephemeral=True,
+            )
+            return
+        delta_percent = current - self.start_value
+        minutes = round(delta_percent / 100 * self.total_reference, 1)
+        await apply_log(interaction, "audio_percent", current, None, minutes,
+                         f"{EMOJI_PERCENTAGE} logged **{current:g}% listened** (**{minutes:+g} min** this sprint).")
+
+
+class LogAudioTimeModal(discord.ui.Modal, title="Log Audiobook Progress (Time)"):
+    current_hours_input = discord.ui.TextInput(label="Current point — hours in", required=False, default="0")
+    current_minutes_input = discord.ui.TextInput(label="Current point — minutes in", required=False, default="0")
+
+    def __init__(self, start_value: float, total_reference: float | None):
+        super().__init__()
+        self.start_value = start_value
+
+    async def on_submit(self, interaction: discord.Interaction):
+        hours = _parse_int(self.current_hours_input.value) or 0
+        minutes = _parse_int(self.current_minutes_input.value) or 0
+        if hours < 0 or minutes < 0:
+            await interaction.response.send_message(
+                embed=discord.Embed(description="Enter a valid elapsed time.", color=ALERT_COLOR), ephemeral=True,
+            )
+            return
+        current_total = hours * 60 + minutes
+        delta = current_total - self.start_value
+        await apply_log(interaction, "audio_time", float(current_total), None, float(delta),
+                         f"{EMOJI_AUDIOBOOK} logged **{_format_minutes_label(current_total)} in** (**{delta:+g} min** this sprint).")
+
+
+class LogFanficModal(discord.ui.Modal, title="Log Fanfic Words"):
+    current_words_input = discord.ui.TextInput(label="What's your word count now?", placeholder="e.g. 3200")
+
+    def __init__(self, start_value: float, total_reference: float | None):
+        super().__init__()
+        self.start_value = start_value
+
+    async def on_submit(self, interaction: discord.Interaction):
+        current = _parse_int(self.current_words_input.value)
+        if current is None or current < 0:
+            await interaction.response.send_message(
+                embed=discord.Embed(description="Enter a whole word count.", color=ALERT_COLOR), ephemeral=True,
+            )
+            return
+        delta = current - self.start_value
+        pages = round(delta / FANFIC_WORDS_PER_PAGE, 1)
+        await apply_log(interaction, "fanfic", float(current), pages, None,
+                         f"{EMOJI_QUILL} logged **{current:,} words** (**{pages:+g} pages** this sprint).")
+
+
+LOG_MODAL_FACTORIES = {
+    "pages": lambda start, total: LogPageBasedModal("pages", start),
+    "ebook_pages": lambda start, total: LogPageBasedModal("ebook_pages", start),
+    "ebook_percent": lambda start, total: LogEbookPercentModal(start, total),
+    "audio_percent": lambda start, total: LogAudioPercentModal(start, total),
+    "audio_time": lambda start, total: LogAudioTimeModal(start, total),
+    "fanfic": lambda start, total: LogFanficModal(start, total),
+}
 
 
 # ===== PERSISTENT VIEWS (attached to real channel messages, re-registered every boot) =====
@@ -1041,7 +1311,9 @@ class SprintLogButtonView(discord.ui.View):
 
 
 async def finish_sprint(sprint_id: int):
-    """Waits out the remaining sprint time, then posts results and closes it out."""
+    """Waits out the remaining sprint time, posts the 'log your progress' message, then
+    arms a grace-period timer that auto-posts results in RESULTS_GRACE_SECONDS (or sooner
+    if everyone's reported already — see apply_log)."""
     sprint = await run_blocking(db_get_sprint, sprint_id)
     if sprint is None or sprint["status"] != "active":
         return
@@ -1057,19 +1329,22 @@ async def finish_sprint(sprint_id: int):
     active_sprint_tasks.pop(sprint_id, None)
 
     channel = bot.get_channel(int(sprint["channel_id"]))
-    if channel is None:
-        return
-    participants = await run_blocking(db_get_participants, sprint_id)
-    mentions = " ".join(f"<@{p['user_id']}>" for p in participants)
-    try:
-        await channel.send(
-            content=mentions or None,
-            embed=build_sprint_end_embed(sprint, participants),
-            view=SprintLogButtonView(),
-            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-        )
-    except discord.HTTPException as error:
-        print("Failed to post sprint end embed:", error)
+    if channel is not None:
+        participants = await run_blocking(db_get_participants, sprint_id)
+        mentions = " ".join(f"<@{p['user_id']}>" for p in participants)
+        try:
+            await channel.send(
+                content=mentions or None,
+                embed=build_sprint_end_embed(sprint, participants),
+                view=SprintLogButtonView(),
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        except discord.HTTPException as error:
+            print("Failed to post sprint end embed:", error)
+
+    grace_deadline = now_utc() + timedelta(seconds=RESULTS_GRACE_SECONDS)
+    await run_blocking(db_start_results_grace, sprint_id, grace_deadline)
+    grace_tasks[sprint_id] = bot.loop.create_task(run_results_grace_period(sprint_id, RESULTS_GRACE_SECONDS))
 
 
 async def start_sprint(guild_id: int, channel: discord.abc.Messageable, host_id: int, duration_minutes: int) -> bool:
@@ -1115,13 +1390,6 @@ async def sprint_start(interaction: discord.Interaction, duration_minutes: app_c
         )
         return
     await interaction.response.send_message("Sprint started!", ephemeral=True)
-
-
-@sprint_group.command(name="join", description="Join the active sprint in this channel.")
-@app_commands.describe(log_type="How you're tracking this sprint", book_title="What you're reading (optional)")
-@app_commands.choices(log_type=JOIN_LOG_TYPE_CHOICES)
-async def sprint_join(interaction: discord.Interaction, log_type: app_commands.Choice[str], book_title: str = ""):
-    await handle_join(interaction, log_type.value, book_title)
 
 
 @sprint_group.command(name="status", description="Show the active sprint's time remaining and participants.")
@@ -1191,6 +1459,69 @@ async def sprint_set_role(interaction: discord.Interaction, role: discord.Role):
 async def sprint_clear_role(interaction: discord.Interaction):
     await run_blocking(set_guild_setting, interaction.guild_id, SPRINT_ROLE_SETTING_KEY, "")
     await interaction.response.send_message("✅ Sprints will no longer ping a role when they start.", ephemeral=True)
+
+
+# ===== /sprint join SUBCOMMANDS (one per tracking type, matching the button/modal fields) =====
+join_group = app_commands.Group(name="join", description="Join the active sprint in this channel.", parent=sprint_group)
+
+
+@join_group.command(name="pages", description="Join tracking a physical book by page number.")
+@app_commands.describe(starting_page="What page are you starting on?", book_title="What you're reading (optional)")
+async def join_pages(interaction: discord.Interaction, starting_page: app_commands.Range[int, 0, None], book_title: str = ""):
+    await handle_join(interaction, "pages", book_title, float(starting_page), None)
+
+
+@join_group.command(name="ebook-pages", description="Join tracking an ebook by page number.")
+@app_commands.describe(starting_page="What page are you starting on?", book_title="What you're reading (optional)")
+async def join_ebook_pages(interaction: discord.Interaction, starting_page: app_commands.Range[int, 0, None], book_title: str = ""):
+    await handle_join(interaction, "ebook_pages", book_title, float(starting_page), None)
+
+
+@join_group.command(name="ebook-percent", description="Join tracking an ebook by percent complete.")
+@app_commands.describe(
+    starting_percent="What percent are you starting at?",
+    total_pages="Book's total page count",
+    book_title="What you're reading (optional)",
+)
+async def join_ebook_percent(interaction: discord.Interaction, starting_percent: app_commands.Range[float, 0, 100],
+                              total_pages: app_commands.Range[int, 1, None], book_title: str = ""):
+    await handle_join(interaction, "ebook_percent", book_title, starting_percent, float(total_pages))
+
+
+@join_group.command(name="audio-percent", description="Join tracking an audiobook by percent listened.")
+@app_commands.describe(
+    starting_percent="Percent listened so far",
+    total_hours="Audiobook total length — hours",
+    total_minutes="Audiobook total length — minutes",
+    book_title="What you're listening to (optional)",
+)
+async def join_audio_percent(interaction: discord.Interaction, starting_percent: app_commands.Range[float, 0, 100],
+                              total_hours: app_commands.Range[int, 0, None] = 0, total_minutes: app_commands.Range[int, 0, 59] = 0,
+                              book_title: str = ""):
+    total = total_hours * 60 + total_minutes
+    if total <= 0:
+        await interaction.response.send_message(
+            embed=discord.Embed(description="Enter the audiobook's total length.", color=ALERT_COLOR), ephemeral=True,
+        )
+        return
+    await handle_join(interaction, "audio_percent", book_title, starting_percent, float(total))
+
+
+@join_group.command(name="audio-time", description="Join tracking an audiobook by elapsed listening time.")
+@app_commands.describe(
+    starting_hours="Starting point — hours in",
+    starting_minutes="Starting point — minutes in",
+    book_title="What you're listening to (optional)",
+)
+async def join_audio_time(interaction: discord.Interaction, starting_hours: app_commands.Range[int, 0, None] = 0,
+                           starting_minutes: app_commands.Range[int, 0, 59] = 0, book_title: str = ""):
+    await handle_join(interaction, "audio_time", book_title, float(starting_hours * 60 + starting_minutes), None)
+
+
+@join_group.command(name="fanfic", description="Join tracking a fanfic by word count.")
+@app_commands.describe(starting_words="Your starting word count", fic_title="Fic title (optional)")
+async def join_fanfic(interaction: discord.Interaction, starting_words: app_commands.Range[int, 0, None] = 0, fic_title: str = ""):
+    await handle_join(interaction, "fanfic", fic_title, float(starting_words), None)
 
 
 bot.tree.add_command(sprint_group)
@@ -1411,6 +1742,15 @@ async def on_ready():
         active_sprint_tasks[sprint["id"]] = bot.loop.create_task(finish_sprint(sprint["id"]))
     if active_sprints:
         print(f"Re-armed {len(active_sprints)} in-progress sprint(s).")
+
+    # Re-arm results grace-period timers for sprints that ended while the bot was offline.
+    awaiting_results = await run_blocking(db_get_sprints_awaiting_results)
+    for sprint in awaiting_results:
+        grace_ends_at = sprint.get("results_grace_ends_at")
+        remaining = max((grace_ends_at - now_utc()).total_seconds(), 0) if grace_ends_at else 0
+        grace_tasks[sprint["id"]] = bot.loop.create_task(run_results_grace_period(sprint["id"], remaining))
+    if awaiting_results:
+        print(f"Re-armed {len(awaiting_results)} results grace period(s).")
 
     if not scheduled_sprint_loop.is_running():
         scheduled_sprint_loop.start()
