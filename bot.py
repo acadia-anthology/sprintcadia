@@ -52,6 +52,9 @@ def _set_footer(embed: discord.Embed):
 
 
 # ===== SPRINT CARD (Pillow-rendered participant image for the announcement) =====
+ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+PHOENIX_ASSET_PATH = os.path.join(ASSET_DIR, "phoenix.png")
+
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 FONT_BOLD_PATH = os.path.join(FONT_DIR, "LiberationSans-Bold.ttf")
 FONT_REGULAR_PATH = os.path.join(FONT_DIR, "LiberationSans-Regular.ttf")
@@ -65,6 +68,21 @@ CARD_BOTTOM_COLOR = (60, 24, 12)  # dark ember, toward the brand orange
 
 _http_session: aiohttp.ClientSession | None = None
 _image_cache: dict[str, Image.Image] = {}
+_phoenix_asset: Image.Image | None = None
+_phoenix_asset_loaded = False
+
+
+def _get_phoenix_asset() -> Image.Image | None:
+    """Loads assets/phoenix.png once and caches it — a local file, no network fetch needed."""
+    global _phoenix_asset, _phoenix_asset_loaded
+    if not _phoenix_asset_loaded:
+        _phoenix_asset_loaded = True
+        try:
+            _phoenix_asset = Image.open(PHOENIX_ASSET_PATH).convert("RGBA")
+        except Exception as error:
+            print("Phoenix asset load failed:", error)
+            _phoenix_asset = None
+    return _phoenix_asset
 
 
 async def _get_http_session() -> aiohttp.ClientSession:
@@ -138,10 +156,13 @@ def _truncate(text: str, max_len: int) -> str:
     return text if len(text) <= max_len else text[: max_len - 1].rstrip() + "…"
 
 
-def _render_sprint_card_sync(host_name: str, host_avatar: Image.Image | None,
-                              rows: list[dict], phoenix_watermark: Image.Image | None) -> bytes:
+HOST_ROW_HEIGHT = 40
+HOST_TEXT_COLOR = (242, 153, 74)  # matches BRAND_COLOR
+
+
+def _render_sprint_card_sync(host_name: str, rows: list[dict]) -> bytes:
     row_count = max(len(rows), 1)
-    height = CARD_PADDING * 2 + CARD_ROW_HEIGHT * (1 + row_count)
+    height = CARD_PADDING * 2 + HOST_ROW_HEIGHT + CARD_ROW_HEIGHT * row_count
     width = CARD_WIDTH
 
     canvas = Image.new("RGB", (width, height))
@@ -154,9 +175,16 @@ def _render_sprint_card_sync(host_name: str, host_avatar: Image.Image | None,
         draw.line([(0, y), (width, y)], fill=(r, g, b))
 
     canvas = canvas.convert("RGBA")
-    if phoenix_watermark is not None and height >= phoenix_watermark.height + 24:
-        wm = phoenix_watermark.copy()
-        alpha = wm.getchannel("A").point(lambda a: int(a * 0.16))
+    phoenix_asset = _get_phoenix_asset()
+    if phoenix_asset is not None:
+        # Scale to fit the available height so it always renders, capped at 240px wide
+        # on taller cards rather than skipped outright on short ones.
+        available_h = max(height - 24, 40)
+        scale = min(240 / phoenix_asset.width, available_h / phoenix_asset.height)
+        target_w = max(int(phoenix_asset.width * scale), 1)
+        target_h = max(int(phoenix_asset.height * scale), 1)
+        wm = phoenix_asset.resize((target_w, target_h), Image.LANCZOS)
+        alpha = wm.getchannel("A").point(lambda a: int(a * 0.22))
         wm.putalpha(alpha)
         canvas.alpha_composite(wm, (width - wm.width - 12, height - wm.height - 12))
 
@@ -169,11 +197,8 @@ def _render_sprint_card_sync(host_name: str, host_avatar: Image.Image | None,
     text_x = x_avatar + CARD_AVATAR_SIZE + 16
     y = CARD_PADDING
 
-    if host_avatar is not None:
-        _paste_circular(canvas, host_avatar, x_avatar, y, CARD_AVATAR_SIZE)
-    draw.text((text_x, y + 2), "HOSTING", font=font_small, fill=(255, 190, 140))
-    draw.text((text_x, y + 22), _truncate(host_name, 40), font=font_bold, fill=(255, 255, 255))
-    y += CARD_ROW_HEIGHT
+    draw.text((CARD_PADDING, y + 4), f"HOSTED BY: {_truncate(host_name, 40)}", font=font_small, fill=HOST_TEXT_COLOR)
+    y += HOST_ROW_HEIGHT
 
     draw.line([(CARD_PADDING, y - 6), (width - CARD_PADDING, y - 6)], fill=(255, 255, 255, 60), width=1)
 
@@ -199,10 +224,7 @@ def _render_sprint_card_sync(host_name: str, host_avatar: Image.Image | None,
 
 
 async def build_sprint_card_file(sprint: dict, participants: list[dict]) -> discord.File:
-    host_id = int(sprint["host_id"])
-    host_name, host_avatar = await asyncio.gather(
-        _resolve_display_name(host_id), _fetch_avatar_image(host_id),
-    )
+    host_name = await _resolve_display_name(int(sprint["host_id"]))
 
     rows = []
     for p in participants:
@@ -218,9 +240,7 @@ async def build_sprint_card_file(sprint: dict, participants: list[dict]) -> disc
             "subtitle": " — ".join(parts) if parts else "Just joined",
         })
 
-    phoenix_watermark = await _get_cached_emoji_image(EMOJI_PHOENIX, 200)
-
-    png_bytes = await run_blocking(_render_sprint_card_sync, host_name, host_avatar, rows, phoenix_watermark)
+    png_bytes = await run_blocking(_render_sprint_card_sync, host_name, rows)
     return discord.File(io.BytesIO(png_bytes), filename="sprint_card.png")
 
 
