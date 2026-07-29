@@ -25,6 +25,7 @@ FANFIC_WORDS_PER_PAGE = 250
 
 SPRINT_ROLE_SETTING_KEY = "Sprint Ping Role ID"
 RESULTS_GRACE_SECONDS = 300  # 5 minutes after a sprint ends before results auto-post
+START_DELAY_MINUTES = 1  # sprints start 1 minute after /sprint start, so people can still join in
 
 # ===== CUSTOM APPLICATION EMOJIS (uploaded to the bot itself in the Dev Portal) =====
 EMOJI_TIMER = "<:timer:1531488929201524958>"
@@ -567,12 +568,13 @@ def db_create_sprint(guild_id: int, channel_id: int, host_id: int, duration_minu
     if conn is None:
         return None
     try:
-        ends_at = now_utc() + timedelta(minutes=duration_minutes)
+        started_at = now_utc() + timedelta(minutes=START_DELAY_MINUTES)
+        ends_at = started_at + timedelta(minutes=duration_minutes)
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO sprints (guild_id, channel_id, host_id, duration_minutes, ends_at)
-                VALUES (%s, %s, %s, %s, %s) RETURNING id
-            """, (str(guild_id), str(channel_id), str(host_id), duration_minutes, ends_at))
+                INSERT INTO sprints (guild_id, channel_id, host_id, duration_minutes, started_at, ends_at)
+                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+            """, (str(guild_id), str(channel_id), str(host_id), duration_minutes, started_at, ends_at))
             sprint_id = cur.fetchone()[0]
         conn.commit()
         return sprint_id
