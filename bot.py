@@ -1553,7 +1553,8 @@ async def start_sprint(guild_id: int, channel: discord.abc.Messageable, host_id:
     participants = await run_blocking(db_get_participants, sprint_id)
 
     role_id = await run_blocking(get_guild_setting, guild_id, SPRINT_ROLE_SETTING_KEY, "")
-    announce_text = f"a new sprint has ignited! {EMOJI_FIRE}"
+    duration_unit = "minute" if duration_minutes == 1 else "minutes"
+    announce_text = f"a new sprint has ignited for **{duration_minutes} {duration_unit}**! {EMOJI_FIRE}"
     content = f"<@&{role_id}> {announce_text}" if role_id else announce_text
     allowed = discord.AllowedMentions(roles=True, users=False, everyone=False) if role_id else discord.AllowedMentions.none()
 
