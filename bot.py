@@ -13,8 +13,7 @@ import psycopg2.pool
 import psycopg2.extras
 
 # ===== EMBED BRANDING =====
-SPRINT_COLOR = discord.Color.from_str("#4FD1C5")   # active sprint / info
-RESULT_COLOR = discord.Color.from_str("#F2994A")   # sprint ended / results
+BRAND_COLOR = discord.Color.from_str("#F2994A")    # every embed border, always orange
 ALERT_COLOR = discord.Color.from_str("#EB5757")    # errors, cancellations
 
 # ===== ENVIRONMENT VARIABLES =====
@@ -61,8 +60,8 @@ CARD_WIDTH = 680
 CARD_ROW_HEIGHT = 74
 CARD_PADDING = 24
 CARD_AVATAR_SIZE = 56
-CARD_TOP_COLOR = (16, 42, 45)     # dark teal, matches SPRINT_COLOR
-CARD_BOTTOM_COLOR = (60, 24, 12)  # dark ember, matches RESULT_COLOR
+CARD_TOP_COLOR = (16, 42, 45)     # dark teal
+CARD_BOTTOM_COLOR = (60, 24, 12)  # dark ember, toward the brand orange
 
 _http_session: aiohttp.ClientSession | None = None
 _image_cache: dict[str, Image.Image] = {}
@@ -952,20 +951,20 @@ def _relative_and_clock(dt: datetime) -> str:
 
 def build_sprint_announcement_embed(sprint: dict) -> discord.Embed:
     """Duration/Starts/Ends stay as native embed fields so Discord's <t:...:R> timestamps
-    keep auto-updating for free; host + participants are rendered into the attached
-    Pillow card instead (see build_sprint_card_file) so they can show avatars."""
-    embed = discord.Embed(title=f"{EMOJI_FIRE} Sprint ignited!", color=SPRINT_COLOR)
+    keep auto-updating for free; host + participants are rendered into a Pillow card
+    (see build_sprint_card_file) attached to the same message as a plain image, outside
+    the embed's border, rather than via embed.set_image()."""
+    embed = discord.Embed(title=f"{EMOJI_FIRE} Sprint ignited!", color=BRAND_COLOR)
     embed.add_field(name=f"{EMOJI_TIMER} Duration", value=f"{sprint['duration_minutes']} min", inline=True)
     embed.add_field(name=f"{EMOJI_HOURGLASS} Starts", value=_relative_and_clock(sprint["started_at"]), inline=True)
     embed.add_field(name=f"{EMOJI_HOURGLASS} Ends", value=_relative_and_clock(sprint["ends_at"]), inline=True)
-    embed.set_image(url="attachment://sprint_card.png")
     _set_footer(embed)
     return embed
 
 
 def build_sprint_status_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
     lines = [_participant_line(p) for p in participants] or ["No one has joined yet."]
-    embed = discord.Embed(title=f"{EMOJI_TIMER} Sprint status", color=SPRINT_COLOR)
+    embed = discord.Embed(title=f"{EMOJI_TIMER} Sprint status", color=BRAND_COLOR)
     embed.add_field(name=f"{EMOJI_HOURGLASS} Ends", value=_relative_and_clock(sprint["ends_at"]), inline=True)
     embed.add_field(name=f"{EMOJI_BOOKSTACK} Participants ({len(participants)})", value="\n".join(lines), inline=False)
     _set_footer(embed)
@@ -981,7 +980,7 @@ def build_sprint_end_embed(sprint: dict, participants: list[dict]) -> discord.Em
             f"The {sprint['duration_minutes']}-minute sprint is over. Tap **Log Sprint** below.\n"
             f"Results post automatically in {grace_minutes} minutes — sooner if everyone's logged in."
         ),
-        color=RESULT_COLOR,
+        color=BRAND_COLOR,
     )
     embed.add_field(name=f"{EMOJI_BOOKSTACK} Participants", value=names, inline=False)
     _set_footer(embed)
@@ -1028,7 +1027,7 @@ def build_sprint_results_embed(participants: list[dict]) -> discord.Embed:
         for i, p in enumerate(reported)
     ]
 
-    embed = discord.Embed(title=f"{EMOJI_PHOENIXICON} Sprint results", color=RESULT_COLOR)
+    embed = discord.Embed(title=f"{EMOJI_PHOENIXICON} Sprint results", color=BRAND_COLOR)
     embed.add_field(
         name="Reported",
         value="\n".join(ranked_lines) or "No one has reported yet.",
@@ -1052,7 +1051,7 @@ def build_sprint_results_embed(participants: list[dict]) -> discord.Embed:
 
 
 def build_stats_embed(member: discord.abc.User, stats: dict) -> discord.Embed:
-    embed = discord.Embed(title=f"{EMOJI_PHOENIXICON} {member.display_name}'s stats", color=SPRINT_COLOR)
+    embed = discord.Embed(title=f"{EMOJI_PHOENIXICON} {member.display_name}'s stats", color=BRAND_COLOR)
     embed.add_field(name=f"{EMOJI_SPRINTING} Sprints completed", value=str(stats["total_sprints"]), inline=True)
     embed.add_field(name=f"{EMOJI_PAGE} Total pages", value=f"{float(stats['total_pages']):g}", inline=True)
     embed.add_field(name=f"{EMOJI_AUDIOBOOK} Total minutes", value=f"{float(stats['total_minutes_read']):g}", inline=True)
@@ -1061,7 +1060,7 @@ def build_stats_embed(member: discord.abc.User, stats: dict) -> discord.Embed:
 
 
 def build_leaderboard_embed(guild_name: str, metric: str, rows: list[dict]) -> discord.Embed:
-    embed = discord.Embed(title=f"{EMOJI_FIRE} {guild_name} leaderboard — {metric}", color=SPRINT_COLOR)
+    embed = discord.Embed(title=f"{EMOJI_FIRE} {guild_name} leaderboard — {metric}", color=BRAND_COLOR)
     if not rows:
         embed.description = "No sprint data yet."
         return embed
@@ -1705,7 +1704,7 @@ async def schedule_list(interaction: discord.Interaction):
         f"`#{r['id']}` <#{r['channel_id']}> — {WEEKDAY_NAMES[r['day_of_week']]} {r['time_utc']} UTC, {r['duration_minutes']}min"
         for r in rows
     ]
-    embed = discord.Embed(title="📅 Scheduled sprints", description="\n".join(lines), color=SPRINT_COLOR)
+    embed = discord.Embed(title="📅 Scheduled sprints", description="\n".join(lines), color=BRAND_COLOR)
     await interaction.response.send_message(embed=embed)
 
 
