@@ -154,7 +154,7 @@ def _render_sprint_card_sync(host_name: str, host_avatar: Image.Image | None,
         draw.line([(0, y), (width, y)], fill=(r, g, b))
 
     canvas = canvas.convert("RGBA")
-    if phoenix_watermark is not None:
+    if phoenix_watermark is not None and height >= phoenix_watermark.height + 24:
         wm = phoenix_watermark.copy()
         alpha = wm.getchannel("A").point(lambda a: int(a * 0.16))
         wm.putalpha(alpha)
@@ -1178,11 +1178,22 @@ async def refresh_sprint_announcement(sprint_id: int):
     except discord.HTTPException:
         return
     participants = await run_blocking(db_get_participants, sprint_id)
-    card_file = await build_sprint_card_file(sprint, participants)
+
+    card_file = None
     try:
-        await message.edit(embed=build_sprint_announcement_embed(sprint), attachments=[card_file])
-    except discord.HTTPException:
-        pass
+        card_file = await build_sprint_card_file(sprint, participants)
+    except Exception as error:
+        print("refresh_sprint_announcement: build_sprint_card_file failed:", repr(error))
+
+    try:
+        if card_file is not None:
+            await message.edit(embed=build_sprint_announcement_embed(sprint), attachments=[card_file])
+        else:
+            # Card render failed — still update the embed (Duration/Starts/Ends) rather
+            # than leaving the whole refresh a silent no-op.
+            await message.edit(embed=build_sprint_announcement_embed(sprint))
+    except discord.HTTPException as error:
+        print("refresh_sprint_announcement: message.edit failed:", repr(error))
 
 
 async def post_sprint_results(sprint_id: int):
@@ -1540,7 +1551,12 @@ async def start_sprint(guild_id: int, channel: discord.abc.Messageable, host_id:
     content = f"<@&{role_id}>" if role_id else None
     allowed = discord.AllowedMentions(roles=True, users=False, everyone=False) if role_id else discord.AllowedMentions.none()
 
-    card_file = await build_sprint_card_file(sprint, participants)
+    card_file = None
+    try:
+        card_file = await build_sprint_card_file(sprint, participants)
+    except Exception as error:
+        print("start_sprint: build_sprint_card_file failed:", repr(error))
+
     message = await channel.send(
         content=content,
         embed=build_sprint_announcement_embed(sprint),
