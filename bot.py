@@ -970,20 +970,18 @@ def _relative_and_clock(dt: datetime) -> str:
 
 
 def build_sprint_announcement_embed(sprint: dict) -> discord.Embed:
-    """Duration/Starts/Ends are one stacked line each (not side-by-side fields) so
-    Discord's <t:...:R> timestamps keep auto-updating for free; host + participants are
-    rendered into a Pillow card (see build_sprint_card_file) attached to the same message
-    as a plain image, outside the embed's border, rather than via embed.set_image()."""
+    """Starts/Ends are one stacked line each (not side-by-side fields) so Discord's
+    <t:...:R> timestamps keep auto-updating for free; host + participants are rendered
+    into a Pillow card (see build_sprint_card_file) attached to the same message as a
+    plain image, outside the embed's border, rather than via embed.set_image()."""
     embed = discord.Embed(
-        title=f"{EMOJI_FIRE} Sprint ignited!",
         description=(
-            f"{EMOJI_TIMER} **Duration:** {sprint['duration_minutes']} min\n"
             f"{EMOJI_HOURGLASS} **Starts:** <t:{int(sprint['started_at'].timestamp())}:R>\n"
             f"{EMOJI_QUILL} **Ends:** <t:{int(sprint['ends_at'].timestamp())}:R>"
         ),
         color=BRAND_COLOR,
     )
-    _set_footer(embed)
+    embed.set_thumbnail(url=_emoji_cdn_url(EMOJI_OPENBOOK))
     return embed
 
 
