@@ -388,6 +388,29 @@ def init_postgres_schema():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sprints_channel_status ON sprints (channel_id, status)")
+
+            # One-time cleanup so the unique index below can actually be created: a race
+            # between two near-simultaneous /sprint start calls (or two bot processes
+            # briefly overlapping during a redeploy) could let two 'active' sprints exist
+            # for the same channel. /sprint cancel only ever cancels the most recent one
+            # (db_get_active_sprint orders by started_at DESC), leaving the older one
+            # stuck 'active' forever and blocking every future /sprint start. Keep only
+            # the most recent active sprint per channel; mark any others cancelled.
+            cur.execute("""
+                UPDATE sprints s1 SET status = 'cancelled'
+                WHERE status = 'active' AND EXISTS (
+                    SELECT 1 FROM sprints s2
+                    WHERE s2.channel_id = s1.channel_id AND s2.status = 'active'
+                        AND (s2.started_at, s2.id) > (s1.started_at, s1.id)
+                )
+            """)
+            # Now enforce it going forward at the database level, so this can't recur
+            # even if two /sprint start calls race past the application-level check.
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_sprint_per_channel
+                ON sprints (channel_id) WHERE status = 'active'
+            """)
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS sprint_participants (
                     sprint_id          INT NOT NULL REFERENCES sprints(id),
@@ -985,7 +1008,6 @@ def build_sprint_announcement_embed(sprint: dict) -> discord.Embed:
         ),
         color=BRAND_COLOR,
     )
-    embed.set_thumbnail(url=_emoji_cdn_url(EMOJI_OPENBOOK))
     return embed
 
 
