@@ -996,19 +996,19 @@ def _relative_and_clock(dt: datetime) -> str:
     return f"<t:{ts}:R>\n<t:{ts}:t>"
 
 
-def build_sprint_announcement_embed(sprint: dict) -> discord.Embed:
-    """Starts/Ends are one stacked line each (not side-by-side fields) so Discord's
-    <t:...:R> timestamps keep auto-updating for free; host + participants are rendered
-    into a Pillow card (see build_sprint_card_file) attached to the same message as a
-    plain image, outside the embed's border, rather than via embed.set_image()."""
-    embed = discord.Embed(
-        description=(
-            f"{EMOJI_HOURGLASS} **Starts:** <t:{int(sprint['started_at'].timestamp())}:R>\n"
-            f"{EMOJI_QUILL} **Ends:** <t:{int(sprint['ends_at'].timestamp())}:R>"
-        ),
-        color=BRAND_COLOR,
+def build_sprint_announcement_content(sprint: dict, role_id: str) -> str:
+    """Plain message content (no embed) using Discord's markdown heading + subtext
+    syntax. Starts/Ends use <t:...:R> so they keep auto-updating client-side for free —
+    no need to ever edit this text again after the message is first sent."""
+    duration_minutes = sprint["duration_minutes"]
+    duration_unit = "minute" if duration_minutes == 1 else "minutes"
+    role_prefix = f"<@&{role_id}> " if role_id else ""
+    starts_ts = int(sprint["started_at"].timestamp())
+    ends_ts = int(sprint["ends_at"].timestamp())
+    return (
+        f"## {role_prefix}a new sprint has ignited for **{duration_minutes} {duration_unit}**! {EMOJI_FIRE}\n"
+        f"-# {EMOJI_HOURGLASS} Starts: <t:{starts_ts}:R> | Ends: <t:{ends_ts}:R>"
     )
-    return embed
 
 
 def build_sprint_status_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
@@ -1226,19 +1226,16 @@ async def refresh_sprint_announcement(sprint_id: int):
         return
     participants = await run_blocking(db_get_participants, sprint_id)
 
-    card_file = None
+    # No embed to refresh anymore — the content line's <t:...:R> timestamps auto-update
+    # client-side on their own. Only the attached participant card needs swapping.
     try:
         card_file = await build_sprint_card_file(sprint, participants)
     except Exception as error:
         print("refresh_sprint_announcement: build_sprint_card_file failed:", repr(error))
+        return
 
     try:
-        if card_file is not None:
-            await message.edit(embed=build_sprint_announcement_embed(sprint), attachments=[card_file])
-        else:
-            # Card render failed — still update the embed (Duration/Starts/Ends) rather
-            # than leaving the whole refresh a silent no-op.
-            await message.edit(embed=build_sprint_announcement_embed(sprint))
+        await message.edit(attachments=[card_file])
     except discord.HTTPException as error:
         print("refresh_sprint_announcement: message.edit failed:", repr(error))
 
@@ -1595,9 +1592,7 @@ async def start_sprint(guild_id: int, channel: discord.abc.Messageable, host_id:
     participants = await run_blocking(db_get_participants, sprint_id)
 
     role_id = await run_blocking(get_guild_setting, guild_id, SPRINT_ROLE_SETTING_KEY, "")
-    duration_unit = "minute" if duration_minutes == 1 else "minutes"
-    announce_text = f"a new sprint has ignited for **{duration_minutes} {duration_unit}**! {EMOJI_FIRE}"
-    content = f"<@&{role_id}> {announce_text}" if role_id else announce_text
+    content = build_sprint_announcement_content(sprint, role_id)
     allowed = discord.AllowedMentions(roles=True, users=False, everyone=False) if role_id else discord.AllowedMentions.none()
 
     card_file = None
@@ -1608,7 +1603,6 @@ async def start_sprint(guild_id: int, channel: discord.abc.Messageable, host_id:
 
     message = await channel.send(
         content=content,
-        embed=build_sprint_announcement_embed(sprint),
         view=SprintJoinView(),
         allowed_mentions=allowed,
         file=card_file,
