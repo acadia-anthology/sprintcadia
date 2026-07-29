@@ -1020,83 +1020,145 @@ def build_sprint_status_embed(sprint: dict, participants: list[dict]) -> discord
     return embed
 
 
-def build_sprint_end_embed(sprint: dict, participants: list[dict]) -> discord.Embed:
-    names = "\n".join(_participant_line(p) for p in participants) or "No one joined this one."
-    grace_minutes = RESULTS_GRACE_SECONDS // 60
-    embed = discord.Embed(
-        title=f"{EMOJI_PHOENIX} Sprint complete — rise & report!",
-        description=(
-            f"The {sprint['duration_minutes']}-minute sprint is over. Tap **Log Sprint** below.\n"
-            f"Results post automatically in {grace_minutes} minutes — sooner if everyone's logged in."
-        ),
-        color=BRAND_COLOR,
-    )
-    embed.add_field(name=f"{EMOJI_BOOKSTACK} Participants", value=names, inline=False)
-    _set_footer(embed)
-    return embed
-
-
 MEDALS = ["🥇", "🥈", "🥉"]
 
 
-def _format_result_line(p: dict, rank_prefix: str = "") -> str:
-    uid = p["user_id"]
-    title = f" *({p['book_title']})*" if p.get("book_title") else ""
+def _format_result_subtitle(p: dict) -> str:
+    """Same numbers as the old embed version, minus the <@id> mention (an image can't
+    resolve those) and markdown bold — this is drawn as plain text on the results card."""
     if not p["reported"]:
         start_str = _format_start_value(p)
-        started = f" (started at {start_str})" if start_str else ""
-        return f"{rank_prefix}<@{uid}>{title}{started} — no report yet"
+        return f"started at {start_str} — no report yet" if start_str else "no report yet"
 
     log_type = p["log_type"]
     raw = p["raw_amount"]
     if log_type in ("pages", "ebook_pages"):
-        return f"{rank_prefix}<@{uid}>{title} — page **{int(raw)}** (**{float(p['pages_equivalent']):+g} pages**)"
+        return f"page {int(raw)} ({float(p['pages_equivalent']):+g} pages)"
     if log_type == "ebook_percent":
-        return f"{rank_prefix}<@{uid}>{title} — **{float(raw):g}%** (**{float(p['pages_equivalent']):+g} pages**)"
+        return f"{float(raw):g}% ({float(p['pages_equivalent']):+g} pages)"
     if log_type == "audio_percent":
-        return f"{rank_prefix}<@{uid}>{title} — **{float(raw):g}%** listened (**{float(p['minutes_equivalent']):+g} min**)"
+        return f"{float(raw):g}% listened ({float(p['minutes_equivalent']):+g} min)"
     if log_type == "audio_time":
-        return f"{rank_prefix}<@{uid}>{title} — **{_format_minutes_label(raw)} in** (**{float(p['minutes_equivalent']):+g} min**)"
+        return f"{_format_minutes_label(raw)} in ({float(p['minutes_equivalent']):+g} min)"
     if log_type == "fanfic":
-        return f"{rank_prefix}<@{uid}>{title} — **{int(raw):,} words** (**{float(p['pages_equivalent']):+g} pages**)"
-    return f"{rank_prefix}<@{uid}>{title} — reported"
+        return f"{int(raw):,} words ({float(p['pages_equivalent']):+g} pages)"
+    return "reported"
 
 
-def build_sprint_results_embed(participants: list[dict]) -> discord.Embed:
+RESULTS_TOP_COLOR = (48, 32, 10)      # warm bronze — distinct from the live card's teal
+RESULTS_BOTTOM_COLOR = (12, 8, 6)     # near-black ember, darker/richer than the live card
+RESULTS_ACCENT_COLOR = (255, 205, 90)  # gold
+RESULTS_HEADER_HEIGHT = 60
+RESULTS_TOTAL_BAND_HEIGHT = 56
+
+
+def _render_results_card_sync(rows: list[dict], total_line: str) -> bytes:
+    row_count = max(len(rows), 1)
+    height = CARD_PADDING * 2 + RESULTS_HEADER_HEIGHT + CARD_ROW_HEIGHT * row_count + RESULTS_TOTAL_BAND_HEIGHT
+    width = CARD_WIDTH
+
+    canvas = Image.new("RGB", (width, height))
+    draw = ImageDraw.Draw(canvas)
+    for y in range(height):
+        t = y / max(height - 1, 1)
+        r = int(RESULTS_TOP_COLOR[0] + (RESULTS_BOTTOM_COLOR[0] - RESULTS_TOP_COLOR[0]) * t)
+        g = int(RESULTS_TOP_COLOR[1] + (RESULTS_BOTTOM_COLOR[1] - RESULTS_TOP_COLOR[1]) * t)
+        b = int(RESULTS_TOP_COLOR[2] + (RESULTS_BOTTOM_COLOR[2] - RESULTS_TOP_COLOR[2]) * t)
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
+
+    canvas = canvas.convert("RGBA")
+    phoenix_asset = _get_phoenix_asset()
+    if phoenix_asset is not None:
+        # Bigger, brighter, and top-right (vs. the live card's bottom-right corner watermark)
+        # so the two cards read as visually distinct at a glance.
+        available_h = max(height - 24, 40)
+        scale = min(280 / phoenix_asset.width, available_h / phoenix_asset.height)
+        target_w = max(int(phoenix_asset.width * scale), 1)
+        target_h = max(int(phoenix_asset.height * scale), 1)
+        wm = phoenix_asset.resize((target_w, target_h), Image.LANCZOS)
+        alpha = wm.getchannel("A").point(lambda a: int(a * 0.30))
+        wm.putalpha(alpha)
+        canvas.alpha_composite(wm, (width - wm.width - 12, 12))
+
+    draw = ImageDraw.Draw(canvas)
+    font_header = ImageFont.truetype(FONT_BOLD_PATH, 26)
+    font_bold = ImageFont.truetype(FONT_BOLD_PATH, 21)
+    font_regular = ImageFont.truetype(FONT_REGULAR_PATH, 16)
+
+    x_avatar = CARD_PADDING
+    text_x = x_avatar + CARD_AVATAR_SIZE + 16
+    y = CARD_PADDING
+
+    draw.text((CARD_PADDING, y), "SPRINT RESULTS", font=font_header, fill=RESULTS_ACCENT_COLOR)
+    y += RESULTS_HEADER_HEIGHT
+    draw.line([(CARD_PADDING, y - 10), (width - CARD_PADDING, y - 10)], fill=(255, 255, 255, 70), width=1)
+
+    if not rows:
+        draw.text((text_x, y + CARD_ROW_HEIGHT // 2 - 10), "No one joined this one.",
+                   font=font_regular, fill=(230, 230, 230))
+        y += CARD_ROW_HEIGHT
+    else:
+        for row in rows:
+            reported = row.get("reported", True)
+            name_color = (255, 255, 255) if reported else (170, 170, 170)
+            sub_color = (225, 225, 225) if reported else (150, 150, 150)
+            if row.get("avatar") is not None:
+                _paste_circular(canvas, row["avatar"], x_avatar, y, CARD_AVATAR_SIZE)
+            draw.text((text_x, y + 2), _truncate(row["name"], 44), font=font_bold, fill=name_color)
+            sub_x = text_x
+            if row.get("icon") is not None:
+                icon_small = row["icon"].resize((18, 18), Image.LANCZOS)
+                canvas.alpha_composite(icon_small, (text_x, y + 28))
+                sub_x = text_x + 24
+            draw.text((sub_x, y + 26), _truncate(row["subtitle"], 60), font=font_regular, fill=sub_color)
+            y += CARD_ROW_HEIGHT
+
+    band_top = height - RESULTS_TOTAL_BAND_HEIGHT
+    band = Image.new("RGBA", (width, RESULTS_TOTAL_BAND_HEIGHT), (255, 205, 90, 40))
+    canvas.alpha_composite(band, (0, band_top))
+    draw.line([(0, band_top), (width, band_top)], fill=(255, 205, 90, 90), width=1)
+    draw.text((CARD_PADDING, band_top + RESULTS_TOTAL_BAND_HEIGHT // 2 - 12),
+               f"GROUP TOTAL: {total_line}", font=font_bold, fill=RESULTS_ACCENT_COLOR)
+
+    buffer = io.BytesIO()
+    canvas.convert("RGB").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+async def build_sprint_results_card_file(participants: list[dict]) -> discord.File:
     # db_get_participants already orders reported-first, highest pages_equivalent first —
-    # ranking here is purely cosmetic (medal prefixes), not a re-sort.
     reported = [p for p in participants if p["reported"]]
     unreported = [p for p in participants if not p["reported"]]
 
+    rows = []
+    for p in reported:
+        user_id = int(p["user_id"])
+        name, avatar = await asyncio.gather(_resolve_display_name(user_id), _fetch_avatar_image(user_id))
+        icon = await _get_cached_emoji_image(LOG_TYPE_ICONS.get(p.get("log_type"), EMOJI_OPENBOOK), 64)
+        title = f" ({p['book_title']})" if p.get("book_title") else ""
+        rows.append({
+            "name": name,
+            "avatar": avatar,
+            "icon": icon,
+            "subtitle": _format_result_subtitle(p) + title,
+            "reported": True,
+        })
+    for p in unreported:
+        user_id = int(p["user_id"])
+        name, avatar = await asyncio.gather(_resolve_display_name(user_id), _fetch_avatar_image(user_id))
+        rows.append({"name": name, "avatar": avatar, "icon": None, "subtitle": "no report yet", "reported": False})
+
     total_pages = sum(float(p["pages_equivalent"]) for p in reported if p["pages_equivalent"] is not None)
     total_minutes = sum(float(p["minutes_equivalent"]) for p in reported if p["minutes_equivalent"] is not None)
-
-    ranked_lines = [
-        _format_result_line(p, MEDALS[i] + " " if i < len(MEDALS) else f"{i + 1}. ")
-        for i, p in enumerate(reported)
-    ]
-
-    embed = discord.Embed(title=f"{EMOJI_PHOENIXICON} Sprint results", color=BRAND_COLOR)
-    embed.add_field(
-        name="Reported",
-        value="\n".join(ranked_lines) or "No one has reported yet.",
-        inline=False,
-    )
-    if unreported:
-        embed.add_field(
-            name="Still waiting on",
-            value="\n".join(f"<@{p['user_id']}>" for p in unreported),
-            inline=False,
-        )
-
     totals = []
     if total_pages:
-        totals.append(f"**{total_pages:g} pages**")
+        totals.append(f"{total_pages:g} pages")
     if total_minutes:
-        totals.append(f"**{total_minutes:g} minutes** of audio")
-    embed.add_field(name=f"{EMOJI_FIRE} Group total", value=" and ".join(totals) if totals else "No progress logged yet.", inline=False)
-    _set_footer(embed)
-    return embed
+        totals.append(f"{total_minutes:g} minutes")
+    total_line = " + ".join(totals) if totals else "No progress logged"
+
+    png_bytes = await run_blocking(_render_results_card_sync, rows, total_line)
+    return discord.File(io.BytesIO(png_bytes), filename="sprint_results.png")
 
 
 def build_stats_embed(member: discord.abc.User, stats: dict) -> discord.Embed:
@@ -1251,8 +1313,9 @@ async def post_sprint_results(sprint_id: int):
         return
     participants = await run_blocking(db_get_participants, sprint_id)
     try:
-        await channel.send(embed=build_sprint_results_embed(participants))
-    except discord.HTTPException as error:
+        results_file = await build_sprint_results_card_file(participants)
+        await channel.send(file=results_file)
+    except Exception as error:
         print("Failed to post sprint results:", error)
 
 
@@ -1560,22 +1623,28 @@ async def finish_sprint(sprint_id: int):
     await run_blocking(db_end_sprint, sprint_id, "ended")
     active_sprint_tasks.pop(sprint_id, None)
 
+    grace_deadline = now_utc() + timedelta(seconds=RESULTS_GRACE_SECONDS)
+    await run_blocking(db_start_results_grace, sprint_id, grace_deadline)
+
     channel = bot.get_channel(int(sprint["channel_id"]))
     if channel is not None:
         participants = await run_blocking(db_get_participants, sprint_id)
         mentions = " ".join(f"<@{p['user_id']}>" for p in participants)
+        mention_part = f" {mentions}" if mentions else ""
+        grace_ts = int(grace_deadline.timestamp())
+        content = (
+            f"{EMOJI_LOG} Sprint complete — rise & report!{mention_part} "
+            f"you have <t:{grace_ts}:R> to log your progress!"
+        )
         try:
             await channel.send(
-                content=mentions or None,
-                embed=build_sprint_end_embed(sprint, participants),
+                content=content,
                 view=SprintLogButtonView(),
                 allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
             )
         except discord.HTTPException as error:
-            print("Failed to post sprint end embed:", error)
+            print("Failed to post sprint end message:", error)
 
-    grace_deadline = now_utc() + timedelta(seconds=RESULTS_GRACE_SECONDS)
-    await run_blocking(db_start_results_grace, sprint_id, grace_deadline)
     grace_tasks[sprint_id] = bot.loop.create_task(run_results_grace_period(sprint_id, RESULTS_GRACE_SECONDS))
 
 
@@ -1654,7 +1723,15 @@ async def sprint_results(interaction: discord.Interaction):
         )
         return
     participants = await run_blocking(db_get_participants, sprint["id"])
-    await interaction.response.send_message(embed=build_sprint_results_embed(participants))
+    try:
+        results_file = await build_sprint_results_card_file(participants)
+        await interaction.response.send_message(file=results_file)
+    except Exception as error:
+        print("sprint_results command failed to build results card:", repr(error))
+        await interaction.response.send_message(
+            embed=discord.Embed(description="⚠️ Something went wrong generating results — try again.", color=ALERT_COLOR),
+            ephemeral=True,
+        )
 
 
 @sprint_group.command(name="cancel", description="Admin/host only: cancel the active sprint in this channel.")
