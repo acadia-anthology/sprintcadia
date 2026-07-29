@@ -157,12 +157,13 @@ def _truncate(text: str, max_len: int) -> str:
 
 
 HOST_ROW_HEIGHT = 40
+PARTICIPANTS_LABEL_HEIGHT = 28
 HOST_TEXT_COLOR = (242, 153, 74)  # matches BRAND_COLOR
 
 
 def _render_sprint_card_sync(host_name: str, rows: list[dict]) -> bytes:
     row_count = max(len(rows), 1)
-    height = CARD_PADDING * 2 + HOST_ROW_HEIGHT + CARD_ROW_HEIGHT * row_count
+    height = CARD_PADDING * 2 + HOST_ROW_HEIGHT + PARTICIPANTS_LABEL_HEIGHT + CARD_ROW_HEIGHT * row_count
     width = CARD_WIDTH
 
     canvas = Image.new("RGB", (width, height))
@@ -201,6 +202,9 @@ def _render_sprint_card_sync(host_name: str, rows: list[dict]) -> bytes:
     y += HOST_ROW_HEIGHT
 
     draw.line([(CARD_PADDING, y - 6), (width - CARD_PADDING, y - 6)], fill=(255, 255, 255, 60), width=1)
+
+    draw.text((CARD_PADDING, y + 6), "PARTICIPANTS", font=font_small, fill=HOST_TEXT_COLOR)
+    y += PARTICIPANTS_LABEL_HEIGHT
 
     if not rows:
         draw.text((text_x, y + CARD_ROW_HEIGHT // 2 - 10), "No one yet — be the first!",
@@ -1155,9 +1159,7 @@ async def handle_join(interaction: discord.Interaction, log_type: str, book_titl
         )
         return
     if joined:
-        start_str = _format_start_value({"log_type": log_type, "start_value": start_value, "total_reference": total_reference})
-        extra = f" — reading *{book_title.strip()}*" if book_title.strip() else ""
-        await interaction.response.send_message(f"{EMOJI_PIN} {interaction.user.mention} joined at **{start_str}**{extra}!")
+        await interaction.response.send_message(f"{EMOJI_PIN} You joined the sprint!", ephemeral=True)
         await refresh_sprint_announcement(sprint["id"])
     else:
         await interaction.response.send_message("You're already in this sprint.", ephemeral=True)
