@@ -1461,69 +1461,6 @@ async def sprint_clear_role(interaction: discord.Interaction):
     await interaction.response.send_message("✅ Sprints will no longer ping a role when they start.", ephemeral=True)
 
 
-# ===== /sprint join SUBCOMMANDS (one per tracking type, matching the button/modal fields) =====
-join_group = app_commands.Group(name="join", description="Join the active sprint in this channel.", parent=sprint_group)
-
-
-@join_group.command(name="pages", description="Join tracking a physical book by page number.")
-@app_commands.describe(starting_page="What page are you starting on?", book_title="What you're reading (optional)")
-async def join_pages(interaction: discord.Interaction, starting_page: app_commands.Range[int, 0, None], book_title: str = ""):
-    await handle_join(interaction, "pages", book_title, float(starting_page), None)
-
-
-@join_group.command(name="ebook-pages", description="Join tracking an ebook by page number.")
-@app_commands.describe(starting_page="What page are you starting on?", book_title="What you're reading (optional)")
-async def join_ebook_pages(interaction: discord.Interaction, starting_page: app_commands.Range[int, 0, None], book_title: str = ""):
-    await handle_join(interaction, "ebook_pages", book_title, float(starting_page), None)
-
-
-@join_group.command(name="ebook-percent", description="Join tracking an ebook by percent complete.")
-@app_commands.describe(
-    starting_percent="What percent are you starting at?",
-    total_pages="Book's total page count",
-    book_title="What you're reading (optional)",
-)
-async def join_ebook_percent(interaction: discord.Interaction, starting_percent: app_commands.Range[float, 0, 100],
-                              total_pages: app_commands.Range[int, 1, None], book_title: str = ""):
-    await handle_join(interaction, "ebook_percent", book_title, starting_percent, float(total_pages))
-
-
-@join_group.command(name="audio-percent", description="Join tracking an audiobook by percent listened.")
-@app_commands.describe(
-    starting_percent="Percent listened so far",
-    total_hours="Audiobook total length — hours",
-    total_minutes="Audiobook total length — minutes",
-    book_title="What you're listening to (optional)",
-)
-async def join_audio_percent(interaction: discord.Interaction, starting_percent: app_commands.Range[float, 0, 100],
-                              total_hours: app_commands.Range[int, 0, None] = 0, total_minutes: app_commands.Range[int, 0, 59] = 0,
-                              book_title: str = ""):
-    total = total_hours * 60 + total_minutes
-    if total <= 0:
-        await interaction.response.send_message(
-            embed=discord.Embed(description="Enter the audiobook's total length.", color=ALERT_COLOR), ephemeral=True,
-        )
-        return
-    await handle_join(interaction, "audio_percent", book_title, starting_percent, float(total))
-
-
-@join_group.command(name="audio-time", description="Join tracking an audiobook by elapsed listening time.")
-@app_commands.describe(
-    starting_hours="Starting point — hours in",
-    starting_minutes="Starting point — minutes in",
-    book_title="What you're listening to (optional)",
-)
-async def join_audio_time(interaction: discord.Interaction, starting_hours: app_commands.Range[int, 0, None] = 0,
-                           starting_minutes: app_commands.Range[int, 0, 59] = 0, book_title: str = ""):
-    await handle_join(interaction, "audio_time", book_title, float(starting_hours * 60 + starting_minutes), None)
-
-
-@join_group.command(name="fanfic", description="Join tracking a fanfic by word count.")
-@app_commands.describe(starting_words="Your starting word count", fic_title="Fic title (optional)")
-async def join_fanfic(interaction: discord.Interaction, starting_words: app_commands.Range[int, 0, None] = 0, fic_title: str = ""):
-    await handle_join(interaction, "fanfic", fic_title, float(starting_words), None)
-
-
 bot.tree.add_command(sprint_group)
 
 
